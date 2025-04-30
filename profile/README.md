@@ -10,9 +10,9 @@ The platform combines the use of an [Angular](https://angular.io/) front-end, a 
 [GitHub](https://github.com/) (obviously), several [Atlassian products](https://www.atlassian.com) (Jira, Trello, Confluence, Ops Genie), [EasyRetro](https://easyretro.io/), [DataDog](https://www.datadog.com/), [HoneyBadger](https://honeybadger.io/),  and others.
 
 ## The Engineering Team
-The building team is fully remote spanning several timezones. They operate following an Agile like methodology and strive to automate when possible. 
+The building team is fully remote spanning several timezones. They operate following an Agile like methodology and strive to automate when possible.
 
 ## Careers
-If this sounds interesting, please view our [Careers listing](https://apply.workable.com/bizzycar/) to apply.
+If this sounds interesting, please view our [Careers listing](https://careers.bizzycar.com) to apply.
 
 You can also find us on [LinkedIn](https://www.linkedin.com/company/bizzycar/).
