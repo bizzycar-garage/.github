@@ -1,10 +1,15 @@
 import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import { join } from "node:path";
-import { createGitHubCheck } from "@grok/agent-sdk/channels/github";
 import { defineTool } from "@grok/agent-sdk/tools";
 import { z } from "zod";
-import { readHeadSha, requirePrRef, upsertPrComment } from "../lib/pr.js";
+import {
+  prUrlSchemaDescription,
+  readHeadSha,
+  requirePrRef,
+  tryCreateCheck,
+  upsertPrComment,
+} from "../lib/pr.js";
 
 const command = z.object({
   label: z.string().min(1).max(120),
@@ -96,13 +101,14 @@ export default defineTool({
   inputSchema: z.object({
     commands: z.array(command).min(1).max(20).describe("Shell commands to run for impacted tests."),
     timeoutMs: z.number().int().positive().max(600_000).optional(),
+    prUrl: z.string().min(1).max(500).optional().describe(prUrlSchemaDescription),
   }),
   dryRunResult: ({ commands }) => ({
     posted: false,
     reason: "dry-run",
     planned: commands.map((item) => item.label),
   }),
-  async execute({ commands, timeoutMs }, ctx) {
+  async execute({ commands, timeoutMs, prUrl }, ctx) {
     if (ctx.session.purpose === "eval") {
       return {
         posted: false,
@@ -118,7 +124,7 @@ export default defineTool({
       };
     }
 
-    const ref = requirePrRef(ctx);
+    const ref = requirePrRef(ctx, prUrl);
     const headSha = await readHeadSha(ctx.workspaceDir);
     const timeout = timeoutMs ?? 180_000;
     const packageJson = join(ctx.workspaceDir, "package.json");
@@ -158,30 +164,23 @@ export default defineTool({
       markdown,
     });
 
-    const check = await createGitHubCheck({
+    const check = await tryCreateCheck({
       github: ctx.host.github,
       owner: ref.owner,
       repo: ref.repo,
       name: "Mr. Nexus / impacted tests",
       sha: headSha,
-      output: {
-        title: allPassed ? "Impacted tests passed" : "Impacted tests failed",
-        summary: markdown,
-      },
-    });
-    await check.conclude({
+      title: allPassed ? "Impacted tests passed" : "Impacted tests failed",
+      summary: markdown,
       conclusion: allPassed ? "success" : "failure",
-      output: {
-        title: allPassed ? "Impacted tests passed" : "Impacted tests failed",
-        summary: markdown,
-      },
     });
 
     return {
       posted: true,
       pr: `${ref.owner}/${ref.repo}#${ref.number}`,
       url: comment.url,
-      checkUrl: check.url,
+      checkUrl: check.checkUrl ?? null,
+      checkSkipped: check.skipped ?? null,
       passed: allPassed,
       results: results.map(({ label, command: cmd, exitCode, passed, durationMs }) => ({
         label,

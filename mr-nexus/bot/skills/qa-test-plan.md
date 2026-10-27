@@ -4,7 +4,8 @@ description: Use when drafting the structured QA test plan for a pull request.
 
 # QA test plan
 
-Read `pr/meta.md` and `pr/diff.patch`.
+If `pr/meta.md` is missing, call `load_pr` with the PR URL from the
+user message first. Then read `pr/meta.md` and `pr/diff.patch`.
 
 Write a markdown plan with these sections only:
 
@@ -15,4 +16,5 @@ Write a markdown plan with these sections only:
 5. **E2E candidates** — user paths to cover when a base URL exists.
 
 Keep each section short. Prefer concrete file or route names from the
-diff. Then call `post_test_plan` with that markdown.
+diff. Then call `post_test_plan` with that markdown (and `prUrl` when
+this is not a GitHub-wake session).

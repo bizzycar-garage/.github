@@ -1,14 +1,15 @@
 import { spawn } from "node:child_process";
 import { access } from "node:fs/promises";
 import { join } from "node:path";
-import { createGitHubCheck } from "@grok/agent-sdk/channels/github";
 import { defineTool } from "@grok/agent-sdk/tools";
 import { z } from "zod";
 import {
+  prUrlSchemaDescription,
   readHeadSha,
   readOptionalText,
   requirePrRef,
   resolveE2eBaseUrl,
+  tryCreateCheck,
   upsertPrComment,
 } from "../lib/pr.js";
 
@@ -51,7 +52,7 @@ async function runShell(cwd: string, shellCommand: string, timeoutMs: number): P
 
 export default defineTool({
   description:
-    "Run product E2E against a PR-provided or E2E_BASE_URL base URL, then post results on the PR.",
+    "Run product E2E against a PR-provided or E2E_BASE_URL base URL, then post results on the PR. Check runs are best-effort under pr-write.",
   effect: "write",
   inputSchema: z.object({
     baseUrl: z.string().url().optional().describe("Override base URL when known."),
@@ -62,6 +63,7 @@ export default defineTool({
       .describe("Shell command to run E2E. Defaults to npx playwright test when omitted."),
     timeoutMs: z.number().int().positive().max(900_000).optional(),
     skipReason: z.string().max(500).optional(),
+    prUrl: z.string().min(1).max(500).optional().describe(prUrlSchemaDescription),
   }),
   dryRunResult: ({ baseUrl, skipReason }) => ({
     posted: false,
@@ -69,7 +71,7 @@ export default defineTool({
     baseUrl: baseUrl ?? null,
     skipped: Boolean(skipReason),
   }),
-  async execute({ baseUrl, command, timeoutMs, skipReason }, ctx) {
+  async execute({ baseUrl, command, timeoutMs, skipReason, prUrl }, ctx) {
     if (ctx.session.purpose === "eval") {
       return {
         posted: false,
@@ -79,7 +81,7 @@ export default defineTool({
       };
     }
 
-    const ref = requirePrRef(ctx);
+    const ref = requirePrRef(ctx, prUrl);
     const headSha = await readHeadSha(ctx.workspaceDir);
     const meta = await readOptionalText(ctx.workspaceDir, "pr/meta.md");
     const resolved =
@@ -99,24 +101,23 @@ export default defineTool({
         kind: "e2e",
         markdown,
       });
-      const check = await createGitHubCheck({
+      const check = await tryCreateCheck({
         github: ctx.host.github,
         owner: ref.owner,
         repo: ref.repo,
         name: "Mr. Nexus / e2e",
         sha: headSha,
-        output: { title: "E2E skipped", summary: markdown },
-      });
-      await check.conclude({
+        title: "E2E skipped",
+        summary: markdown,
         conclusion: "skipped",
-        output: { title: "E2E skipped", summary: markdown },
       });
       return {
         posted: true,
         skipped: true,
         pr: `${ref.owner}/${ref.repo}#${ref.number}`,
         url: comment.url,
-        checkUrl: check.url,
+        checkUrl: check.checkUrl ?? null,
+        checkSkipped: check.skipped ?? null,
         baseUrl: resolved ?? null,
       };
     }
@@ -182,23 +183,15 @@ export default defineTool({
       kind: "e2e",
       markdown,
     });
-    const check = await createGitHubCheck({
+    const check = await tryCreateCheck({
       github: ctx.host.github,
       owner: ref.owner,
       repo: ref.repo,
       name: "Mr. Nexus / e2e",
       sha: headSha,
-      output: {
-        title: passed ? "E2E passed" : "E2E failed",
-        summary: markdown,
-      },
-    });
-    await check.conclude({
+      title: passed ? "E2E passed" : "E2E failed",
+      summary: markdown,
       conclusion: passed ? "success" : "failure",
-      output: {
-        title: passed ? "E2E passed" : "E2E failed",
-        summary: markdown,
-      },
     });
 
     return {
@@ -207,7 +200,8 @@ export default defineTool({
       passed,
       pr: `${ref.owner}/${ref.repo}#${ref.number}`,
       url: comment.url,
-      checkUrl: check.url,
+      checkUrl: check.checkUrl ?? null,
+      checkSkipped: check.skipped ?? null,
       baseUrl: resolved,
       exitCode: result.exitCode,
       durationMs: result.durationMs,
