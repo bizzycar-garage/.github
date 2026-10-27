@@ -3,12 +3,12 @@ import { access } from "node:fs/promises";
 import { join } from "node:path";
 import { defineTool } from "@grok/agent-sdk/tools";
 import { z } from "zod";
+import { acceptAppUrl, resolveE2eBaseUrl } from "../lib/e2e-url.js";
 import {
   prUrlSchemaDescription,
   readHeadSha,
   readOptionalText,
   requirePrRef,
-  resolveE2eBaseUrl,
   tryCreateCheck,
   upsertPrComment,
 } from "../lib/pr.js";
@@ -52,10 +52,14 @@ async function runShell(cwd: string, shellCommand: string, timeoutMs: number): P
 
 export default defineTool({
   description:
-    "Run product E2E against a PR-provided or E2E_BASE_URL base URL, then post results on the PR. With no base URL, post a skip comment and do not run anything. Does not post a check run (pr-write has no checks:write). A skip is not a test failure.",
+    "Run product E2E against an app base URL from E2E_BASE_URL or an explicit preview/staging URL, then post results on the PR. Jira, Atlassian, and other ticket links are ignored. With no app URL, post a skip comment and do not run anything. Does not post a check run (pr-write has no checks:write). A skip is not a test failure.",
   effect: "write",
   inputSchema: z.object({
-    baseUrl: z.string().url().optional().describe("Override base URL when known."),
+    baseUrl: z
+      .string()
+      .url()
+      .optional()
+      .describe("Preview or staging app URL. Jira, Atlassian, and other ticket links are ignored."),
     command: z
       .string()
       .max(2000)
@@ -84,16 +88,16 @@ export default defineTool({
     const ref = requirePrRef(ctx, prUrl);
     const headSha = await readHeadSha(ctx.workspaceDir);
     const meta = await readOptionalText(ctx.workspaceDir, "pr/meta.md");
-    const resolved =
-      baseUrl?.replace(/\/$/, "") ??
-      resolveE2eBaseUrl(meta, process.env.E2E_BASE_URL);
+    const override = acceptAppUrl(baseUrl);
+    const resolved = override ?? resolveE2eBaseUrl(meta, process.env.E2E_BASE_URL);
+    const ignoredNonAppBaseUrl = Boolean(baseUrl?.trim()) && override === undefined;
 
     if (skipReason || !resolved) {
       const markdown = [
         "## Mr. Nexus — E2E",
         "",
         skipReason?.trim() ||
-          "Skipped: no E2E base URL in the PR body/labels or `E2E_BASE_URL`.",
+          "Skipped: no app base URL. Set `E2E_BASE_URL` or an explicit preview/staging http(s) URL. Jira and Atlassian links are not E2E targets.",
       ].join("\n");
       const comment = await upsertPrComment({
         ctx,
@@ -119,6 +123,7 @@ export default defineTool({
         checkUrl: check.checkUrl ?? null,
         checkSkipped: check.skipped ?? null,
         baseUrl: resolved ?? null,
+        ignoredNonAppBaseUrl,
       };
     }
 

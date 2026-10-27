@@ -11,10 +11,10 @@ const OPENED = [
   "",
   "Read pr/meta.md and pr/diff.patch.",
   "Call post_test_plan once with the plan.",
-  "Call run_impacted_tests with the impacted spec commands. The tool shallow-clones the PR head; do not skip when the workspace has no checkout or no package.json.",
+  "Call run_impacted_tests with the impacted spec commands. The tool shallow-clones the PR head and installs Ruby and Bundler when bundle is missing. Do not skip when the workspace has no checkout, no package.json, or no bundle on PATH.",
   "If run_impacted_tests returns outcome skipped, say the checkout was skipped. That is not a test failure and not a check-run error.",
   "Call coverage_summary with the line coverage from that run, or status unavailable when it is null.",
-  "Call e2e_run with no baseUrl when none is configured so the skip is posted. A skip is not a failure.",
+  "Call e2e_run with no baseUrl unless E2E_BASE_URL or an explicit preview/staging app URL is known. Never pass a Jira or Atlassian link. A skip is not a failure.",
 ].join("\n");
 
 const BACKFILL = [

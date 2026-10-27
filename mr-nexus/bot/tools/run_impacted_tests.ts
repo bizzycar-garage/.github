@@ -8,6 +8,7 @@ import {
   resolvePrPin,
   type CheckoutResult,
 } from "../lib/checkout.js";
+import { commandNeedsRuby, ensureImpactedRuby, type RubyBootstrap } from "../lib/ruby-runtime.js";
 import {
   prUrlSchemaDescription,
   requirePrRef,
@@ -42,8 +43,8 @@ const TOKEN_ENV = [
   "CURSOR_SERVICE_ACCOUNT_KEY",
 ];
 
-function testEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+function testEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...extra };
   for (const key of TOKEN_ENV) {
     delete env[key];
   }
@@ -55,13 +56,14 @@ async function runCommand(
   label: string,
   shellCommand: string,
   timeoutMs: number,
+  extraEnv?: NodeJS.ProcessEnv,
 ): Promise<CommandResult> {
   const started = Date.now();
   return await new Promise((resolve) => {
     const child = spawn(shellCommand, {
       cwd,
       shell: true,
-      env: testEnv(),
+      env: testEnv(extraEnv),
     });
     const chunks: Buffer[] = [];
     const onData = (chunk: Buffer) => {
@@ -104,6 +106,7 @@ function resultsMarkdown(
   results: CommandResult[],
   linesPct: number | undefined,
   planned: { label: string; command: string }[],
+  runtimeNote: string | undefined,
 ): string {
   if (!checkout.ok) {
     const lines = [
@@ -125,6 +128,7 @@ function resultsMarkdown(
     "## Mr. Nexus — impacted tests",
     "",
     `**Checkout:** \`${checkout.headSha}\` (shallow)`,
+    ...(runtimeNote ? [`**Runtime:** ${runtimeNote}`] : []),
     `**Result:** ${passed}/${results.length} passed`,
     `**Line coverage:** ${linesPct === undefined ? "unavailable" : `${linesPct}%`}`,
     "",
@@ -141,9 +145,23 @@ function resultsMarkdown(
   return lines.join("\n");
 }
 
+async function bootstrapRuby(
+  checkoutDir: string,
+  commands: readonly string[],
+): Promise<{
+  failed?: Extract<RubyBootstrap, { ok: false }>;
+  note?: string;
+  env?: NodeJS.ProcessEnv;
+}> {
+  const runtime = await ensureImpactedRuby({ checkoutDir, commands });
+  if (!runtime.ok) return { failed: runtime };
+  if (runtime.skipped) return {};
+  return { note: runtime.note, env: runtime.env };
+}
+
 export default defineTool({
   description:
-    "Shallow-clone the PR head, run the impacted test commands in that checkout, and post pass/fail plus any line coverage printed by the runner. Does not require package.json (Rails/RSpec repos are valid). A skipped checkout is not a test failure. Posts a PR comment only; pr-write cannot create check runs.",
+    "Shallow-clone the PR head, install Ruby and Bundler when an RSpec or Rails command needs them, run bundle install, then run the impacted test commands in that checkout. Posts pass/fail plus any line coverage printed by the runner. Does not require package.json. A skipped checkout is not a test failure. Posts a PR comment only; pr-write cannot create check runs.",
   effect: "write",
   inputSchema: z.object({
     commands: z.array(command).min(1).max(20).describe("Shell commands to run for impacted tests, in the PR checkout."),
@@ -194,6 +212,7 @@ export default defineTool({
 
     const fullLogs: string[] = [];
     const results: CommandResult[] = [];
+    let runtimeNote: string | undefined;
     if (!checkout.ok) {
       for (const item of commands) {
         results.push({
@@ -206,8 +225,31 @@ export default defineTool({
         });
       }
     } else {
+      const runtime = await bootstrapRuby(checkout.checkoutDir, commands.map((item) => item.command));
+      if (runtime.failed) {
+        runtimeNote = `bootstrap failed — ${runtime.failed.note}`;
+      } else {
+        runtimeNote = runtime.note;
+      }
       for (const item of commands) {
-        const result = await runCommand(checkout.checkoutDir, item.label, item.command, timeout);
+        if (runtime.failed && commandNeedsRuby(item.command)) {
+          results.push({
+            label: item.label,
+            command: item.command,
+            exitCode: runtime.failed.exitCode,
+            passed: false,
+            durationMs: runtime.failed.durationMs,
+            logTail: runtime.failed.logTail,
+          });
+          continue;
+        }
+        const result = await runCommand(
+          checkout.checkoutDir,
+          item.label,
+          item.command,
+          timeout,
+          runtime.env,
+        );
         fullLogs.push(result.logTail);
         results.push(result);
       }
@@ -216,7 +258,7 @@ export default defineTool({
     const linesPct = extractLinesPct(fullLogs);
     const executed = checkout.ok;
     const passed = executed ? results.every((item) => item.passed) : null;
-    const markdown = resultsMarkdown(checkout, results, linesPct, commands);
+    const markdown = resultsMarkdown(checkout, results, linesPct, commands, runtimeNote);
     const comment = await upsertPrComment({
       ctx,
       ref,
