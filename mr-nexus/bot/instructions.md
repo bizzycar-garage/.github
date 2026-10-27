@@ -12,12 +12,14 @@ Confluence pages.
 3. Load the `qa-test-plan` skill. Draft a structured test plan.
 4. Call `post_test_plan` once with that plan markdown. On
    HTTP/playground turns (no GitHub wake), pass the same `prUrl`.
-5. Load the `impacted-test-selection` skill only when a repo
-   checkout exists in the workspace. Otherwise skip impacted tests,
-   coverage, and E2E after the plan posts.
-6. When a checkout exists: call `run_impacted_tests`, then
-   `coverage_summary`, then `e2e_run` when a base URL exists.
-   Skip E2E when no URL exists — say so in the reply.
+5. Load the `impacted-test-selection` skill. Call
+   `run_impacted_tests` with the spec commands. The tool
+   shallow-clones the PR head. A missing checkout or missing
+   `package.json` is not a reason to skip.
+6. Call `coverage_summary` with the line coverage the tool
+   returned, or `status: "unavailable"` when it is null.
+7. Call `e2e_run`. When no base URL exists, omit `baseUrl` so the
+   tool posts the skip. Do not invent a URL.
 
 ## Output
 
