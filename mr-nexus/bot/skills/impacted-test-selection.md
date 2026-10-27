@@ -12,6 +12,9 @@ description: Use when mapping a PR diff to the nearest unit or integration tests
    - label: `rspec impacted`
    - command: `bundle exec rspec spec/a_spec.rb spec/b_spec.rb --format documentation`
    - `timeoutMs`: `600000` when the repo is Rails
+   The tool installs Ruby and Bundler and runs `bundle install`
+   before that command when `bundle` is not on PATH. Do not skip
+   because the pod has no Bundler.
 4. For a JS repo, use the test script the repo already has
    (`npm test -- path`, `pnpm vitest run path`). Do not invent a runner.
    If the diff changes no application or spec files, one command is enough:
@@ -23,7 +26,9 @@ description: Use when mapping a PR diff to the nearest unit or integration tests
    was skipped. That is not a test failure.
 6. Call `coverage_summary` with `linesPct` from the tool result, or
    `status: "unavailable"` when `linesPct` is null.
-7. Call `e2e_run`. Omit `baseUrl` when none is configured.
+7. Call `e2e_run`. Omit `baseUrl` unless `E2E_BASE_URL` or an
+   explicit preview/staging app URL is known. Never pass a Jira,
+   Atlassian, or `/browse/` ticket link.
 
 Do not invent a test runner. If the repo layout is unclear, choose the
 smallest command the changed paths imply and say so in the command label.

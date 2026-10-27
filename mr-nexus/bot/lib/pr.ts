@@ -239,21 +239,4 @@ export async function loadPrWorkspace(input: {
   };
 }
 
-const E2E_URL_RE = /https?:\/\/[^\s)>"']+/gi;
-const E2E_LABEL_RE = /e2e[_-]?url\s*[:=]\s*(https?:\/\/\S+)/i;
-
-export function resolveE2eBaseUrl(meta: string | undefined, envUrl: string | undefined): string | undefined {
-  if (envUrl && /^https?:\/\//i.test(envUrl.trim())) {
-    return envUrl.trim().replace(/\/$/, "");
-  }
-  if (!meta) {
-    return undefined;
-  }
-  const labeled = meta.match(E2E_LABEL_RE);
-  if (labeled?.[1]) {
-    return labeled[1].replace(/[.,;]+$/, "").replace(/\/$/, "");
-  }
-  const urls = meta.match(E2E_URL_RE) ?? [];
-  const candidate = urls.find((url) => !/github\.com\//i.test(url));
-  return candidate?.replace(/[.,;]+$/, "").replace(/\/$/, "");
-}
+export { resolveE2eBaseUrl } from "./e2e-url.js";

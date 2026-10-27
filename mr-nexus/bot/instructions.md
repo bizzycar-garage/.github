@@ -14,15 +14,18 @@ Confluence pages.
    HTTP/playground turns (no GitHub wake), pass the same `prUrl`.
 5. Load the `impacted-test-selection` skill. Call
    `run_impacted_tests` with the spec commands. The tool
-   shallow-clones the PR head. A missing checkout or missing
-   `package.json` is not a reason to skip.
+   shallow-clones the PR head and, for RSpec, installs Ruby and
+   Bundler when `bundle` is missing. A missing checkout, missing
+   `package.json`, or missing `bundle` on the pod is not a reason
+   to skip.
 6. If `run_impacted_tests` returns `outcome: "skipped"`, say the
    checkout was skipped. That is not a test failure and not a
    check-run error. Do not describe HTTP 403 as a failed test.
 7. Call `coverage_summary` with the line coverage the tool
    returned, or `status: "unavailable"` when it is null.
-8. Call `e2e_run`. When no base URL exists, omit `baseUrl` so the
-   tool posts the skip. Do not invent a URL. A skip is not a failure.
+8. Call `e2e_run`. Omit `baseUrl` unless `E2E_BASE_URL` or an
+   explicit preview/staging app URL is known. Never pass a Jira,
+   Atlassian, or other ticket link. A skip is not a failure.
 
 ## Output
 
