@@ -10,7 +10,14 @@ const OPENED = [
   "Author: sam",
   "",
   "Read pr/meta.md and pr/diff.patch.",
-  "Post a test plan, run impacted tests, summarize coverage, then E2E when a base URL exists.",
+  "Call post_test_plan once with the plan. Skip impacted tests / coverage / E2E unless a checkout exists; prefer posting the plan.",
+].join("\n");
+
+const BACKFILL = [
+  "Backfill QA for open PR https://github.com/acme/shop/pull/42.",
+  "Read that PR (title, body, labels, head SHA, diff).",
+  "Draft a structured test plan (Scope, Risk areas, Manual checks, Automated focus, E2E candidates).",
+  "Call post_test_plan once with that plan. Skip impacted tests / coverage / E2E unless you have a checkout; prefer posting the plan.",
 ].join("\n");
 
 const META = [
@@ -54,6 +61,21 @@ export default defineEval({
         t.succeeded();
         t.calledTool("post_test_plan");
         t.check(t.reply, includes(/test plan|checkout|banner|impacted|coverage|e2e/i));
+      },
+    },
+    {
+      id: "backfill-plan",
+      description: "HTTP backfill message posts a plan (workspace already seeded as load_pr would).",
+      async test(t) {
+        await t.send(BACKFILL, {
+          workspaceFiles: {
+            "pr/meta.md": META,
+            "pr/head.sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pr/diff.patch": DIFF,
+          },
+        });
+        t.succeeded();
+        t.calledTool("post_test_plan");
       },
     },
   ],

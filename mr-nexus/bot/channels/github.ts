@@ -6,12 +6,21 @@ import {
 const MAX_DIFF_CHARS = 150_000;
 const MAX_BODY_CHARS = 20_000;
 
+/** Wake repos for Cursor-account relay (one owner, ≤20). Keep in sync with deploy `--cursor-events-repo`. */
+const WAKE_REPOS = [
+  "bizzycar-garage/hive-api",
+  "bizzycar-garage/hive-web",
+  "bizzycar-garage/hive-recall",
+] as const;
+
 export default githubChannel({
   botName: "mr-nexus",
-  // Repos come from serve/deploy `--repo` (Cursor account relay, one owner, max 20).
-  // Broaden later with a GitHub App webhook when noise is acceptable.
-  cursorAccount: true,
-  checks: true,
+  // `pr-write` covers PR comments. Do not set `checks: true` — that opts the
+  // hosted lease up to contents:write and logs the push-capable token warning.
+  cursorAccount: {
+    repos: [...WAKE_REPOS],
+    permissions: "pr-write",
+  },
   deliverReplies: false,
   onComment: () => null,
   onPullRequest: (ctx, pr) => {
@@ -26,7 +35,7 @@ export default githubChannel({
       auth: dispatch.auth,
       context: [
         "Read pr/meta.md and pr/diff.patch.",
-        "Post a test plan, run impacted tests, summarize coverage, then E2E when a base URL exists.",
+        "Call post_test_plan once with the plan. Skip impacted tests / coverage / E2E unless a checkout exists; prefer posting the plan.",
       ],
       async workspaceFiles() {
         const octokit = await ctx.github.getOctokit();

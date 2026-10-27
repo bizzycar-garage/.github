@@ -1,25 +1,31 @@
-import { createGitHubCheck } from "@grok/agent-sdk/channels/github";
 import { defineTool } from "@grok/agent-sdk/tools";
 import { z } from "zod";
-import { readHeadSha, requirePrRef, upsertPrComment } from "../lib/pr.js";
+import {
+  prUrlSchemaDescription,
+  readHeadSha,
+  requirePrRef,
+  tryCreateCheck,
+  upsertPrComment,
+} from "../lib/pr.js";
 
 export default defineTool({
   description:
-    "Post a coverage summary comment (and check annotation) for the impacted test run.",
+    "Post a coverage summary comment for the impacted test run. Check runs are best-effort under pr-write.",
   effect: "idempotent",
   inputSchema: z.object({
     status: z.enum(["reported", "unavailable"]),
     linesPct: z.number().min(0).max(100).optional(),
     baseLinesPct: z.number().min(0).max(100).optional(),
     notes: z.string().max(2000).optional(),
+    prUrl: z.string().min(1).max(500).optional().describe(prUrlSchemaDescription),
   }),
   dryRunResult: ({ status }) => ({ posted: false, reason: "dry-run", status }),
-  async execute({ status, linesPct, baseLinesPct, notes }, ctx) {
+  async execute({ status, linesPct, baseLinesPct, notes, prUrl }, ctx) {
     if (ctx.session.purpose === "eval") {
       return { posted: false, reason: "eval", status };
     }
 
-    const ref = requirePrRef(ctx);
+    const ref = requirePrRef(ctx, prUrl);
     const headSha = await readHeadSha(ctx.workspaceDir);
     const delta =
       linesPct !== undefined && baseLinesPct !== undefined
@@ -50,23 +56,15 @@ export default defineTool({
       markdown,
     });
 
-    const check = await createGitHubCheck({
+    const check = await tryCreateCheck({
       github: ctx.host.github,
       owner: ref.owner,
       repo: ref.repo,
       name: "Mr. Nexus / coverage",
       sha: headSha,
-      output: {
-        title: status === "unavailable" ? "Coverage unavailable" : "Coverage summary",
-        summary: markdown,
-      },
-    });
-    await check.conclude({
+      title: status === "unavailable" ? "Coverage unavailable" : "Coverage summary",
+      summary: markdown,
       conclusion: status === "unavailable" ? "neutral" : "success",
-      output: {
-        title: status === "unavailable" ? "Coverage unavailable" : "Coverage summary",
-        summary: markdown,
-      },
     });
 
     if (linesPct !== undefined) {
@@ -81,11 +79,11 @@ export default defineTool({
       posted: true,
       pr: `${ref.owner}/${ref.repo}#${ref.number}`,
       url: comment.url,
-      checkUrl: check.url,
+      checkUrl: check.checkUrl ?? null,
+      checkSkipped: check.skipped ?? null,
       status,
-      linesPct,
-      baseLinesPct,
-      delta,
+      linesPct: linesPct ?? null,
+      delta: delta ?? null,
     };
   },
 });

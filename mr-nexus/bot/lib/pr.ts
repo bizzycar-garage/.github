@@ -1,8 +1,10 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
+  createGitHubCheck,
   formatGitHubOutboundComment,
   parseGitHubPrContinuationKey,
+  parseGitHubPrRef,
   type GitHubPullRequestRef,
 } from "@grok/agent-sdk/channels/github";
 import type { ToolContext } from "@grok/agent-sdk/tools";
@@ -11,12 +13,33 @@ export const SHA = /^[0-9a-f]{40}$/i;
 
 export type PrRef = GitHubPullRequestRef;
 
-export function requirePrRef(ctx: ToolContext): PrRef {
-  const ref = parseGitHubPrContinuationKey(ctx.session.continuationKey ?? "");
-  if (ref === undefined) {
-    throw new Error("This tool requires a GitHub pull request session");
+const MAX_DIFF_CHARS = 150_000;
+const MAX_BODY_CHARS = 20_000;
+
+/** Optional PR URL / `owner/repo#N` for HTTP / playground sessions without a GitHub continuation key. */
+export const prUrlSchemaDescription =
+  "GitHub PR URL or owner/repo#N. Required for HTTP/playground sessions; omit when the session already is a GitHub PR turn.";
+
+export function requirePrRef(ctx: ToolContext, prUrl?: string): PrRef {
+  const fromSession = parseGitHubPrContinuationKey(ctx.session.continuationKey ?? "");
+  if (fromSession !== undefined) {
+    return fromSession;
   }
-  return ref;
+  const trimmed = prUrl?.trim() ?? "";
+  if (trimmed !== "") {
+    const fromUrl = parseGitHubPrRef(trimmed);
+    if (fromUrl !== undefined) {
+      return {
+        owner: fromUrl.owner,
+        repo: fromUrl.repo,
+        number: fromUrl.number,
+      };
+    }
+    throw new Error(`Invalid prUrl "${trimmed}"; expected https://github.com/owner/repo/pull/N or owner/repo#N`);
+  }
+  throw new Error(
+    "This tool needs a GitHub pull request session or a prUrl (https://github.com/owner/repo/pull/N).",
+  );
 }
 
 export async function readHeadSha(workspaceDir: string): Promise<string> {
@@ -123,6 +146,110 @@ export async function upsertPrComment(input: {
     commentId: response.data.id,
     url: response.data.html_url,
     updated: false,
+  };
+}
+
+/**
+ * Best-effort Checks API write. With `permissions: "pr-write"` (no `checks: true`)
+ * merge-box checks are unavailable; comment posting must still succeed.
+ */
+export async function tryCreateCheck(input: {
+  github: ToolContext["host"]["github"];
+  owner: string;
+  repo: string;
+  name: string;
+  sha: string;
+  title: string;
+  summary: string;
+  conclusion: "success" | "failure" | "neutral" | "skipped";
+}): Promise<{ checkUrl?: string; skipped?: string }> {
+  try {
+    const check = await createGitHubCheck({
+      github: input.github,
+      owner: input.owner,
+      repo: input.repo,
+      name: input.name,
+      sha: input.sha,
+      output: { title: input.title, summary: input.summary },
+    });
+    await check.conclude({
+      conclusion: input.conclusion,
+      output: { title: input.title, summary: input.summary },
+    });
+    return { checkUrl: check.url };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { skipped: message.slice(0, 300) };
+  }
+}
+
+/** Fetch PR meta + diff through the Cursor GitHub proxy and seed the workspace. */
+export async function loadPrWorkspace(input: {
+  ctx: ToolContext;
+  ref: PrRef;
+}): Promise<{
+  title: string;
+  htmlUrl: string;
+  headSha: string;
+  headRef: string;
+  baseRef: string;
+  labels: string[];
+  metaChars: number;
+  diffChars: number;
+}> {
+  const { ctx, ref } = input;
+  const octokit = await ctx.host.github.getOctokit();
+  const pull = {
+    owner: ref.owner,
+    repo: ref.repo,
+    pull_number: ref.number,
+  };
+  const [meta, diff] = await Promise.all([
+    octokit.rest.pulls.get(pull),
+    octokit.rest.pulls.get({ ...pull, mediaType: { format: "diff" } }),
+  ]);
+  const diffText = typeof diff.data === "string" ? diff.data : "";
+  const body = meta.data.body ?? "";
+  const labels = (meta.data.labels ?? [])
+    .map((label) => (typeof label === "string" ? label : label.name))
+    .filter((name): name is string => typeof name === "string" && name.length > 0);
+  const metaMd = [
+    `# ${meta.data.title}`,
+    "",
+    `PR: ${meta.data.html_url}`,
+    `Head: ${meta.data.head.ref} (${meta.data.head.sha})`,
+    `Base: ${meta.data.base.ref}`,
+    `Author: ${meta.data.user?.login ?? "unknown"}`,
+    `Labels: ${labels.join(", ") || "(none)"}`,
+    "",
+    "## Body",
+    body.length > MAX_BODY_CHARS ? `${body.slice(0, MAX_BODY_CHARS)}\n…[truncated]\n` : body || "(empty)",
+  ].join("\n");
+  const diffOut =
+    diffText.length > MAX_DIFF_CHARS
+      ? `${diffText.slice(0, MAX_DIFF_CHARS)}\n…[truncated]\n`
+      : diffText;
+
+  const files: Record<string, string> = {
+    "pr/meta.md": metaMd,
+    "pr/head.sha": meta.data.head.sha,
+    "pr/diff.patch": diffOut,
+  };
+  for (const [relative, contents] of Object.entries(files)) {
+    const absolute = join(ctx.workspaceDir, relative);
+    await mkdir(dirname(absolute), { recursive: true });
+    await writeFile(absolute, contents, "utf8");
+  }
+
+  return {
+    title: meta.data.title,
+    htmlUrl: meta.data.html_url,
+    headSha: meta.data.head.sha,
+    headRef: meta.data.head.ref,
+    baseRef: meta.data.base.ref,
+    labels,
+    metaChars: metaMd.length,
+    diffChars: diffOut.length,
   };
 }
 

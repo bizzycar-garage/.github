@@ -4,8 +4,11 @@ export default defineAgent({
   name: "Mr. Nexus",
   description:
     "Background QA engineer for Engineering PRs: test plans, impacted tests, coverage, and product E2E.",
+  // Pin to the package DEFAULT-compatible id (`effort` + `fast`). A newer
+  // id that the hosted harness rejects aborts turns with runner_error before
+  // any tool call (no post_test_plan in the trajectory).
   model: {
-    id: "grok-4.7",
+    id: "grok-4.5",
     params: [
       { id: "effort", value: "high" },
       { id: "fast", value: "true" },
