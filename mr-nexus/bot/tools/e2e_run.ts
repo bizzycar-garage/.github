@@ -52,7 +52,7 @@ async function runShell(cwd: string, shellCommand: string, timeoutMs: number): P
 
 export default defineTool({
   description:
-    "Run product E2E against a PR-provided or E2E_BASE_URL base URL, then post results on the PR. Check runs are best-effort under pr-write.",
+    "Run product E2E against a PR-provided or E2E_BASE_URL base URL, then post results on the PR. With no base URL, post a skip comment and do not run anything. Does not post a check run (pr-write has no checks:write). A skip is not a test failure.",
   effect: "write",
   inputSchema: z.object({
     baseUrl: z.string().url().optional().describe("Override base URL when known."),

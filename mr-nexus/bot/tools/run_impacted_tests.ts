@@ -29,7 +29,18 @@ type CommandResult = {
   logTail: string;
 };
 
-const TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "SHALLOW_CLONE_GIT_TOKEN", "GIT_CONFIG_VALUE_0"];
+const TOKEN_ENV = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "HIVE_GIT_READ_TOKEN",
+  "SHALLOW_CLONE_GIT_TOKEN",
+  "SHALLOW_CLONE_GIT_USERNAME",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_KEY_0",
+  "GIT_CONFIG_VALUE_0",
+  "CURSOR_API_KEY",
+  "CURSOR_SERVICE_ACCOUNT_KEY",
+];
 
 function testEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -88,21 +99,38 @@ async function runCommand(
   });
 }
 
-function resultsMarkdown(checkout: CheckoutResult, results: CommandResult[], linesPct: number | undefined): string {
+function resultsMarkdown(
+  checkout: CheckoutResult,
+  results: CommandResult[],
+  linesPct: number | undefined,
+  planned: { label: string; command: string }[],
+): string {
+  if (!checkout.ok) {
+    const lines = [
+      "## Mr. Nexus — impacted tests",
+      "",
+      `**Checkout:** skipped — ${checkout.reason}`,
+      "**Result:** not run. This is not a test failure.",
+      "**Line coverage:** unavailable",
+      "",
+    ];
+    for (const item of planned) {
+      lines.push(`- not run \`${item.label}\``);
+      lines.push(`  \`${item.command}\``);
+    }
+    return lines.join("\n");
+  }
   const passed = results.filter((item) => item.passed).length;
   const lines = [
     "## Mr. Nexus — impacted tests",
     "",
-    checkout.ok
-      ? `**Checkout:** \`${checkout.headSha}\` (shallow)`
-      : `**Checkout:** failed — ${checkout.reason}`,
-    `**Result:** ${passed}/${results.length} passed${checkout.ok ? "" : " (not executed)"}`,
+    `**Checkout:** \`${checkout.headSha}\` (shallow)`,
+    `**Result:** ${passed}/${results.length} passed`,
     `**Line coverage:** ${linesPct === undefined ? "unavailable" : `${linesPct}%`}`,
     "",
   ];
   for (const item of results) {
-    const exit = checkout.ok ? `exit ${item.exitCode ?? "n/a"}, ${item.durationMs}ms` : "not run";
-    lines.push(`- ${item.passed ? "PASS" : "FAIL"} \`${item.label}\` (${exit})`);
+    lines.push(`- ${item.passed ? "PASS" : "FAIL"} \`${item.label}\` (exit ${item.exitCode ?? "n/a"}, ${item.durationMs}ms)`);
     lines.push(`  \`${item.command}\``);
     if (!item.passed && item.logTail.trim()) {
       lines.push("  ```");
@@ -115,7 +143,7 @@ function resultsMarkdown(checkout: CheckoutResult, results: CommandResult[], lin
 
 export default defineTool({
   description:
-    "Shallow-clone the PR head, run the impacted test commands in that checkout, and post pass/fail plus any line coverage printed by the runner. Does not require package.json (Rails/RSpec repos are valid). Check runs are best-effort under pr-write.",
+    "Shallow-clone the PR head, run the impacted test commands in that checkout, and post pass/fail plus any line coverage printed by the runner. Does not require package.json (Rails/RSpec repos are valid). A skipped checkout is not a test failure. Posts a PR comment only; pr-write cannot create check runs.",
   effect: "write",
   inputSchema: z.object({
     commands: z.array(command).min(1).max(20).describe("Shell commands to run for impacted tests, in the PR checkout."),
@@ -186,8 +214,9 @@ export default defineTool({
     }
 
     const linesPct = extractLinesPct(fullLogs);
-    const allPassed = checkout.ok && results.every((item) => item.passed);
-    const markdown = resultsMarkdown(checkout, results, linesPct);
+    const executed = checkout.ok;
+    const passed = executed ? results.every((item) => item.passed) : null;
+    const markdown = resultsMarkdown(checkout, results, linesPct, commands);
     const comment = await upsertPrComment({
       ctx,
       ref,
@@ -202,11 +231,11 @@ export default defineTool({
           repo: ref.repo,
           name: "Mr. Nexus / impacted tests",
           sha: headShaForCheck,
-          title: allPassed ? "Impacted tests passed" : "Impacted tests failed",
+          title: !executed ? "Impacted tests not run" : passed ? "Impacted tests passed" : "Impacted tests failed",
           summary: markdown,
-          conclusion: allPassed ? "success" : "failure",
+          conclusion: !executed ? "skipped" : passed ? "success" : "failure",
         })
-      : { checkUrl: undefined, skipped: "no head SHA for check run" };
+      : { checkUrl: undefined, skipped: "no head SHA; PR comment is the result" };
 
     return {
       posted: true,
@@ -214,17 +243,28 @@ export default defineTool({
       url: comment.url,
       checkUrl: check.checkUrl ?? null,
       checkSkipped: check.skipped ?? null,
-      passed: allPassed,
-      checkout: checkout.ok ? "ready" : "failed",
-      checkoutHeadSha: checkout.ok ? checkout.headSha : null,
+      executed,
+      outcome: !executed ? "skipped" : passed ? "passed" : "failed",
+      passed,
+      checkout: executed ? "ready" : "skipped",
+      checkoutReason: executed ? null : checkout.reason,
+      checkoutHeadSha: executed ? checkout.headSha : null,
       linesPct: linesPct ?? null,
-      results: results.map(({ label, command: cmd, exitCode, passed, durationMs }) => ({
-        label,
-        command: cmd,
-        exitCode,
-        passed,
-        durationMs,
-      })),
+      results: executed
+        ? results.map(({ label, command: cmd, exitCode, passed: commandPassed, durationMs }) => ({
+            label,
+            command: cmd,
+            exitCode,
+            passed: commandPassed,
+            durationMs,
+          }))
+        : commands.map((item) => ({
+            label: item.label,
+            command: item.command,
+            exitCode: null,
+            passed: null,
+            durationMs: 0,
+          })),
     };
   },
 });

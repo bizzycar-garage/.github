@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tryCreateShallowPrCheckout } from "@grok/agent-sdk/scm";
 import type { ToolContext } from "@grok/agent-sdk/tools";
+import { clonePrHead } from "./cursor-clone.js";
 import { readOptionalText, SHA, type PrRef } from "./pr.js";
 
 const HEAD_LINE = /^Head: (\S+) \(([0-9a-f]{40})\)/im;
@@ -63,7 +63,8 @@ export type CheckoutResult =
 /**
  * Shallow-fetch the PR head into `<workspace>/checkout`.
  * Reuses a checkout already detached at the same SHA.
- * Auth is the host `GH_TOKEN` / `GITHUB_TOKEN` (Cursor account lease on hosted runs).
+ * Hosted runs have no `GH_TOKEN`; {@link clonePrHead} uses the Cursor git
+ * proxy, then a pr-write lease minted at call time.
  */
 export async function ensurePrCheckout(input: {
   workspaceDir: string;
@@ -80,22 +81,19 @@ export async function ensurePrCheckout(input: {
     return { ok: true, checkoutDir, headSha: input.headSha };
   }
 
-  const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.number}`;
-  const result = await tryCreateShallowPrCheckout({
-    prUrl,
-    headSha: input.headSha,
-    baseSha: input.baseSha,
-    headBranch: input.headBranch,
+  const result = await clonePrHead({
     checkoutDir,
+    owner: input.owner,
+    repo: input.repo,
+    number: input.number,
+    headSha: input.headSha,
+    headBranch: input.headBranch,
+    baseSha: input.baseSha,
   });
   if (!result.ok) {
-    return { ok: false, reason: redactSecrets(result.reason).slice(0, 500) };
+    return { ok: false, reason: redactSecrets(result.reason).slice(0, 900) };
   }
-  return {
-    ok: true,
-    checkoutDir: result.checkout.checkoutDir,
-    headSha: result.checkout.headSha,
-  };
+  return { ok: true, checkoutDir, headSha: input.headSha };
 }
 
 const COVERAGE_RES = [

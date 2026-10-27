@@ -10,7 +10,7 @@ import {
 
 export default defineTool({
   description:
-    "Post a coverage summary comment for the impacted test run. Check runs are best-effort under pr-write.",
+    "Post a coverage summary comment for the impacted test run. Does not post a check run (pr-write has no checks:write). Unavailable coverage is not a test failure.",
   effect: "idempotent",
   inputSchema: z.object({
     status: z.enum(["reported", "unavailable"]),

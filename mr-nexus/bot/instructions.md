@@ -16,15 +16,20 @@ Confluence pages.
    `run_impacted_tests` with the spec commands. The tool
    shallow-clones the PR head. A missing checkout or missing
    `package.json` is not a reason to skip.
-6. Call `coverage_summary` with the line coverage the tool
+6. If `run_impacted_tests` returns `outcome: "skipped"`, say the
+   checkout was skipped. That is not a test failure and not a
+   check-run error. Do not describe HTTP 403 as a failed test.
+7. Call `coverage_summary` with the line coverage the tool
    returned, or `status: "unavailable"` when it is null.
-7. Call `e2e_run`. When no base URL exists, omit `baseUrl` so the
-   tool posts the skip. Do not invent a URL.
+8. Call `e2e_run`. When no base URL exists, omit `baseUrl` so the
+   tool posts the skip. Do not invent a URL. A skip is not a failure.
 
 ## Output
 
-Keep the chat reply short: which tools ran, pass/fail counts, and
-links the tools returned. The host writes the PR comments.
+Keep the chat reply short: which tools ran, whether tests passed,
+failed, or were skipped, and links the tools returned. The host
+writes the PR comments. A skipped checkout or skipped E2E is not a
+failure.
 
 ## Rules
 
