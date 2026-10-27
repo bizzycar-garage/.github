@@ -23,7 +23,9 @@ description: Use when mapping a PR diff to the nearest unit or integration tests
    sessions pass `prUrl`. The tool clones the PR head and runs the
    commands there. Do not skip because `package.json` is missing.
    If the tool returns `outcome: "skipped"`, report that the checkout
-   was skipped. That is not a test failure.
+   was skipped. That is not a test failure. If it returns
+   `outcome: "bootstrap-failed"`, Ruby did not install and RSpec was
+   not started. That is not a spec failure.
 6. Call `coverage_summary` with `linesPct` from the tool result, or
    `status: "unavailable"` when `linesPct` is null.
 7. Call `e2e_run`. Omit `baseUrl` unless `E2E_BASE_URL` or an

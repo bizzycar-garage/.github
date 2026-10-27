@@ -65,14 +65,94 @@ export function sectionMarker(kind: string): string {
   return `<!-- mr-nexus:${kind} -->`;
 }
 
-export function commentBody(kind: string, markdown: string): string {
-  const marker = sectionMarker(kind);
-  const body = `${markdown.trim()}\n\n${marker}`;
-  return formatGitHubOutboundComment(body);
+/** Plain token kept when a proxy drops HTML comments from the stored body. */
+export function sectionToken(kind: string): string {
+  return `mr-nexus-section:${kind}`;
 }
 
-export async function upsertPrComment(input: {
-  ctx: ToolContext;
+const COMMENT_KINDS = ["test-plan", "impacted-tests", "coverage", "e2e"] as const;
+
+type CommentHost = {
+  session: { id: string };
+  host: {
+    kv: ToolContext["host"]["kv"];
+    github: ToolContext["host"]["github"];
+  };
+};
+
+type StagedComment = {
+  owner: string;
+  repo: string;
+  number: number;
+  kind: string;
+  markdown: string;
+  attempts: number;
+};
+
+function pendingKey(sessionId: string, kind: string): string {
+  return `pr-comment-pending:${sessionId}:${kind}`;
+}
+
+function isStaged(value: unknown): value is StagedComment {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as StagedComment;
+  return (
+    typeof item.owner === "string" &&
+    typeof item.repo === "string" &&
+    typeof item.number === "number" &&
+    typeof item.kind === "string" &&
+    typeof item.markdown === "string" &&
+    typeof item.attempts === "number"
+  );
+}
+
+function sanitizeComment(body: string): string {
+  return body.replaceAll("\u0000", "").slice(0, 60_000);
+}
+
+export function commentBody(kind: string, markdown: string): string {
+  const marker = sectionMarker(kind);
+  const token = sectionToken(kind);
+  const body = `${markdown.trim()}\n\n${token}\n\n${marker}`;
+  return formatGitHubOutboundComment(sanitizeComment(body));
+}
+
+function bodyHasMarker(body: string | null | undefined, kind: string): boolean {
+  if (body === null || body === undefined) return false;
+  return body.includes(sectionMarker(kind)) || body.includes(sectionToken(kind));
+}
+
+/**
+ * Remember the comment a finished turn must publish.
+ * GitHub writes happen at the end of a long tool. A wake that ends first
+ * leaves this record for the turn.completed / turn.failed hook.
+ */
+export async function stagePrComment(input: {
+  ctx: CommentHost;
+  ref: PrRef;
+  kind: string;
+  markdown: string;
+}): Promise<void> {
+  const { ctx, ref, kind, markdown } = input;
+  const current = await ctx.host.kv.get(pendingKey(ctx.session.id, kind));
+  const attempts = isStaged(current) ? current.attempts : 0;
+  const staged: StagedComment = {
+    owner: ref.owner,
+    repo: ref.repo,
+    number: ref.number,
+    kind,
+    markdown,
+    attempts,
+  };
+  await ctx.host.kv.put(pendingKey(ctx.session.id, kind), staged);
+}
+
+async function clearStaged(ctx: CommentHost, kind: string): Promise<void> {
+  await ctx.host.kv.delete(pendingKey(ctx.session.id, kind));
+}
+
+async function writePrComment(input: {
+  ctx: CommentHost;
   ref: PrRef;
   kind: string;
   markdown: string;
@@ -90,47 +170,47 @@ export async function upsertPrComment(input: {
       ? (stored as { commentId: number }).commentId
       : undefined;
 
-  if (storedId !== undefined) {
-    try {
-      const response = await octokit.rest.issues.updateComment({
-        owner: ref.owner,
-        repo: ref.repo,
-        comment_id: storedId,
-        body,
-      });
-      return {
-        posted: true,
-        commentId: response.data.id,
-        url: response.data.html_url,
-        updated: true,
-      };
-    } catch {
-      // Fall through and create a new comment when the stored id is gone.
-    }
-  }
-
-  const marker = sectionMarker(kind);
-  const existing = await octokit.paginate(octokit.rest.issues.listComments, {
-    owner: ref.owner,
-    repo: ref.repo,
-    issue_number: ref.number,
-    per_page: 100,
-  });
-  const match = existing.find((item) => item.body?.includes(marker));
-  if (match !== undefined) {
+  const updated = async (commentId: number) => {
     const response = await octokit.rest.issues.updateComment({
       owner: ref.owner,
       repo: ref.repo,
-      comment_id: match.id,
+      comment_id: commentId,
       body,
     });
     await ctx.host.kv.put(kvKey, { commentId: response.data.id });
     return {
-      posted: true,
+      posted: true as const,
       commentId: response.data.id,
       url: response.data.html_url,
       updated: true,
     };
+  };
+
+  if (storedId !== undefined) {
+    try {
+      return await updated(storedId);
+    } catch {
+      // Stored id is stale, or this token cannot edit it. Search, then create.
+    }
+  }
+
+  try {
+    const existing = await octokit.paginate(octokit.rest.issues.listComments, {
+      owner: ref.owner,
+      repo: ref.repo,
+      issue_number: ref.number,
+      per_page: 100,
+    });
+    const match = existing.find((item) => bodyHasMarker(item.body, kind));
+    if (match !== undefined) {
+      try {
+        return await updated(match.id);
+      } catch {
+        // Fall through and create when the matched comment cannot be edited.
+      }
+    }
+  } catch {
+    // Listing failed. A new comment is still better than leaving the marker stale.
   }
 
   const response = await octokit.rest.issues.createComment({
@@ -146,6 +226,54 @@ export async function upsertPrComment(input: {
     url: response.data.html_url,
     updated: false,
   };
+}
+
+export async function upsertPrComment(input: {
+  ctx: ToolContext;
+  ref: PrRef;
+  kind: string;
+  markdown: string;
+}): Promise<{ posted: true; commentId: number; url: string; updated: boolean }> {
+  await stagePrComment(input);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const result = await writePrComment(input);
+      await clearStaged(input.ctx, input.kind);
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** Publish comments a tool staged but did not finish posting. */
+export async function flushStagedPrComments(ctx: CommentHost): Promise<void> {
+  for (const kind of COMMENT_KINDS) {
+    const key = pendingKey(ctx.session.id, kind);
+    const staged = await ctx.host.kv.get(key);
+    if (!isStaged(staged) || staged.kind !== kind) continue;
+    if (staged.attempts >= 2) {
+      await ctx.host.kv.delete(key);
+      continue;
+    }
+    await ctx.host.kv.put(key, { ...staged, attempts: staged.attempts + 1 });
+    try {
+      await writePrComment({
+        ctx,
+        ref: { owner: staged.owner, repo: staged.repo, number: staged.number },
+        kind: staged.kind,
+        markdown: staged.markdown,
+      });
+      await ctx.host.kv.delete(key);
+    } catch {
+      // Leave the record. A later finished turn tries once more.
+    }
+  }
 }
 
 /**

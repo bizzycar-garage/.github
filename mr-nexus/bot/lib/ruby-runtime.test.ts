@@ -8,6 +8,7 @@ import { test } from "node:test";
 import {
   bootstrapScriptBodies,
   commandNeedsRuby,
+  commandWithAbsoluteBundle,
   ensureImpactedRuby,
   parseBundledWith,
   parseRequestedRuby,
@@ -30,6 +31,16 @@ test("reads .ruby-version and BUNDLED WITH", () => {
   assert.equal(parseRequestedRuby(undefined, "source 'https://rubygems.org'\nruby '3.3.6'\n"), "3.3.6");
   assert.equal(parseRequestedRuby("# comment\n", "ruby '~> 3.2'\n"), undefined);
   assert.equal(parseBundledWith("GEM\n  remote: https://rubygems.org/\n\nBUNDLED WITH\n   2.5.22\n"), "2.5.22");
+});
+
+test("spec commands use the absolute bundle path", () => {
+  const bin = "/home/runner/.mr-nexus/ruby/3.3.5/bin/bundle";
+  assert.equal(
+    commandWithAbsoluteBundle("bundle exec rspec spec/a_spec.rb spec/b_spec.rb --format documentation", bin),
+    `'${bin}' exec rspec spec/a_spec.rb spec/b_spec.rb --format documentation`,
+  );
+  assert.equal(commandWithAbsoluteBundle("npm test", bin), "npm test");
+  assert.equal(commandWithAbsoluteBundle("echo vendor/bundle", bin), "echo vendor/bundle");
 });
 
 test("ruby-builder URLs stay on the ruby-builder release path", () => {
@@ -89,7 +100,14 @@ test("installs the pinned Ruby and Bundler before bundle install", async () => {
       assert.match(env.PATH ?? "", /prebuilt/);
       return {
         exitCode: 0,
-        log: "Bundler version 2.5.22\nMR_NEXUS_GEM_BIN=/opt/gem-bin\n",
+        log: [
+          "Bundler version 2.5.22",
+          "MR_NEXUS_GEM_BIN=/opt/gem-bin",
+          "MR_NEXUS_GEM_HOME=/opt/gem-home",
+          "MR_NEXUS_GEM_PATH=/opt/gem-home",
+          "MR_NEXUS_BUNDLE_EXE=/opt/gem-bin/bundle",
+          "",
+        ].join("\n"),
         durationMs: 4,
       };
     }
@@ -111,6 +129,11 @@ test("installs the pinned Ruby and Bundler before bundle install", async () => {
     if (!result.ok || result.skipped) return;
     assert.match(result.note, /installed ruby 3\.3\.6, bundler 2\.5\.22; bundle install ok/);
     assert.match(result.env.PATH ?? "", /gem-bin/);
+    assert.match(result.env.PATH ?? "", /prebuilt/);
+    assert.equal(result.env.GEM_HOME, "/opt/gem-home");
+    assert.equal(result.env.GEM_PATH, "/opt/gem-home");
+    assert.equal(result.bundleBin, "/opt/gem-bin/bundle");
+    assert.equal(result.env.MR_NEXUS_BUNDLE_BIN, "/opt/gem-bin/bundle");
     assert.deepEqual(steps, ["probe", "apt-packages", "probe", "prebuilt-ruby", "probe", "gem-bundler", "probe", "bundle-install", "probe"]);
   } finally {
     if (previous === undefined) delete process.env.GH_TOKEN;
@@ -146,4 +169,28 @@ test("skips bootstrap for non-ruby commands and reports a failed ruby download",
   assert.equal(failed.exitCode, 1);
   assert.match(failed.note, /could not install ruby 3\.3\.6/);
   assert.match(failed.logTail, /download failed/);
+
+  const timedOut = await ensureImpactedRuby({
+    checkoutDir,
+    commands: ["bundle exec rspec spec/a_spec.rb"],
+    run: async ({ step }) => {
+      if (step === "probe") return { exitCode: 0, log: "", durationMs: 1 };
+      if (step === "prebuilt-ruby") {
+        return {
+          exitCode: null,
+          signal: "SIGTERM",
+          log: "mr-nexus: downloading https://github.com/ruby/ruby-builder/releases/download/ruby-3.3.6/ruby-3.3.6-ubuntu-24.04-x64.tar.gz\ncurl: (28) Connection timed out\n",
+          durationMs: 180_000,
+        };
+      }
+      return { exitCode: 0, log: "", durationMs: 1 };
+    },
+  });
+  assert.equal(timedOut.ok, false);
+  if (timedOut.ok) return;
+  assert.equal(timedOut.exitCode, null);
+  assert.match(timedOut.note, /timed out/);
+  assert.match(timedOut.note, /RSpec was not started/);
+  assert.match(timedOut.logTail, /Connection timed out/);
+  assert.doesNotMatch(timedOut.note, /127/);
 });
