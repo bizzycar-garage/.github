@@ -1,11 +1,15 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
-import { join } from "node:path";
 import { defineTool } from "@grok/agent-sdk/tools";
 import { z } from "zod";
 import {
+  ensurePrCheckout,
+  extractLinesPct,
+  redactSecrets,
+  resolvePrPin,
+  type CheckoutResult,
+} from "../lib/checkout.js";
+import {
   prUrlSchemaDescription,
-  readHeadSha,
   requirePrRef,
   tryCreateCheck,
   upsertPrComment,
@@ -25,6 +29,16 @@ type CommandResult = {
   logTail: string;
 };
 
+const TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "SHALLOW_CLONE_GIT_TOKEN", "GIT_CONFIG_VALUE_0"];
+
+function testEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of TOKEN_ENV) {
+    delete env[key];
+  }
+  return env;
+}
+
 async function runCommand(
   cwd: string,
   label: string,
@@ -36,7 +50,7 @@ async function runCommand(
     const child = spawn(shellCommand, {
       cwd,
       shell: true,
-      env: process.env,
+      env: testEnv(),
     });
     const chunks: Buffer[] = [];
     const onData = (chunk: Buffer) => {
@@ -50,7 +64,7 @@ async function runCommand(
     const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
     child.on("close", (code) => {
       clearTimeout(timer);
-      const log = Buffer.concat(chunks).toString("utf8");
+      const log = redactSecrets(Buffer.concat(chunks).toString("utf8"));
       resolve({
         label,
         command: shellCommand,
@@ -68,22 +82,27 @@ async function runCommand(
         exitCode: null,
         passed: false,
         durationMs: Date.now() - started,
-        logTail: String(error),
+        logTail: redactSecrets(String(error)),
       });
     });
   });
 }
 
-function resultsMarkdown(results: CommandResult[]): string {
+function resultsMarkdown(checkout: CheckoutResult, results: CommandResult[], linesPct: number | undefined): string {
   const passed = results.filter((item) => item.passed).length;
   const lines = [
     "## Mr. Nexus — impacted tests",
     "",
-    `**Result:** ${passed}/${results.length} passed`,
+    checkout.ok
+      ? `**Checkout:** \`${checkout.headSha}\` (shallow)`
+      : `**Checkout:** failed — ${checkout.reason}`,
+    `**Result:** ${passed}/${results.length} passed${checkout.ok ? "" : " (not executed)"}`,
+    `**Line coverage:** ${linesPct === undefined ? "unavailable" : `${linesPct}%`}`,
     "",
   ];
   for (const item of results) {
-    lines.push(`- ${item.passed ? "PASS" : "FAIL"} \`${item.label}\` (exit ${item.exitCode ?? "n/a"}, ${item.durationMs}ms)`);
+    const exit = checkout.ok ? `exit ${item.exitCode ?? "n/a"}, ${item.durationMs}ms` : "not run";
+    lines.push(`- ${item.passed ? "PASS" : "FAIL"} \`${item.label}\` (${exit})`);
     lines.push(`  \`${item.command}\``);
     if (!item.passed && item.logTail.trim()) {
       lines.push("  ```");
@@ -96,10 +115,10 @@ function resultsMarkdown(results: CommandResult[]): string {
 
 export default defineTool({
   description:
-    "Run the selected impacted test commands in the session workspace, post a PR comment, and update a check run.",
+    "Shallow-clone the PR head, run the impacted test commands in that checkout, and post pass/fail plus any line coverage printed by the runner. Does not require package.json (Rails/RSpec repos are valid). Check runs are best-effort under pr-write.",
   effect: "write",
   inputSchema: z.object({
-    commands: z.array(command).min(1).max(20).describe("Shell commands to run for impacted tests."),
+    commands: z.array(command).min(1).max(20).describe("Shell commands to run for impacted tests, in the PR checkout."),
     timeoutMs: z.number().int().positive().max(600_000).optional(),
     prUrl: z.string().min(1).max(500).optional().describe(prUrlSchemaDescription),
   }),
@@ -125,19 +144,29 @@ export default defineTool({
     }
 
     const ref = requirePrRef(ctx, prUrl);
-    const headSha = await readHeadSha(ctx.workspaceDir);
-    const timeout = timeoutMs ?? 180_000;
-    const packageJson = join(ctx.workspaceDir, "package.json");
-    let hasPackage = false;
+    const timeout = timeoutMs ?? 300_000;
+    let headShaForCheck: string | undefined;
+    let checkout: CheckoutResult;
     try {
-      await access(packageJson);
-      hasPackage = true;
-    } catch {
-      hasPackage = false;
+      const pin = await resolvePrPin(ctx, ref);
+      headShaForCheck = pin.headSha;
+      checkout = await ensurePrCheckout({
+        workspaceDir: ctx.workspaceDir,
+        owner: ref.owner,
+        repo: ref.repo,
+        number: ref.number,
+        headSha: pin.headSha,
+        headBranch: pin.headBranch,
+        baseSha: pin.baseSha,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      checkout = { ok: false, reason: redactSecrets(message).slice(0, 500) };
     }
 
+    const fullLogs: string[] = [];
     const results: CommandResult[] = [];
-    if (!hasPackage) {
+    if (!checkout.ok) {
       for (const item of commands) {
         results.push({
           label: item.label,
@@ -145,18 +174,20 @@ export default defineTool({
           exitCode: null,
           passed: false,
           durationMs: 0,
-          logTail:
-            "No package.json in the session workspace. Seed a checkout or run with a workspace that contains the repo before re-running.",
+          logTail: "",
         });
       }
     } else {
       for (const item of commands) {
-        results.push(await runCommand(ctx.workspaceDir, item.label, item.command, timeout));
+        const result = await runCommand(checkout.checkoutDir, item.label, item.command, timeout);
+        fullLogs.push(result.logTail);
+        results.push(result);
       }
     }
 
-    const allPassed = results.every((item) => item.passed);
-    const markdown = resultsMarkdown(results);
+    const linesPct = extractLinesPct(fullLogs);
+    const allPassed = checkout.ok && results.every((item) => item.passed);
+    const markdown = resultsMarkdown(checkout, results, linesPct);
     const comment = await upsertPrComment({
       ctx,
       ref,
@@ -164,16 +195,18 @@ export default defineTool({
       markdown,
     });
 
-    const check = await tryCreateCheck({
-      github: ctx.host.github,
-      owner: ref.owner,
-      repo: ref.repo,
-      name: "Mr. Nexus / impacted tests",
-      sha: headSha,
-      title: allPassed ? "Impacted tests passed" : "Impacted tests failed",
-      summary: markdown,
-      conclusion: allPassed ? "success" : "failure",
-    });
+    const check = headShaForCheck
+      ? await tryCreateCheck({
+          github: ctx.host.github,
+          owner: ref.owner,
+          repo: ref.repo,
+          name: "Mr. Nexus / impacted tests",
+          sha: headShaForCheck,
+          title: allPassed ? "Impacted tests passed" : "Impacted tests failed",
+          summary: markdown,
+          conclusion: allPassed ? "success" : "failure",
+        })
+      : { checkUrl: undefined, skipped: "no head SHA for check run" };
 
     return {
       posted: true,
@@ -182,6 +215,9 @@ export default defineTool({
       checkUrl: check.checkUrl ?? null,
       checkSkipped: check.skipped ?? null,
       passed: allPassed,
+      checkout: checkout.ok ? "ready" : "failed",
+      checkoutHeadSha: checkout.ok ? checkout.headSha : null,
+      linesPct: linesPct ?? null,
       results: results.map(({ label, command: cmd, exitCode, passed, durationMs }) => ({
         label,
         command: cmd,

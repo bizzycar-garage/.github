@@ -4,14 +4,24 @@ description: Use when mapping a PR diff to the nearest unit or integration tests
 
 # Impacted test selection
 
-1. List changed files from `pr/diff.patch`.
-2. Prefer colocated tests (`*.test.*`, `*.spec.*`, `__tests__`).
-3. Fall back to the nearest package or folder test script.
-4. Build 1–5 shell commands the repo already understands
-   (for example `npm test -- path/to/file` or `pnpm vitest run path`).
-5. Call `run_impacted_tests` with those commands.
-6. Call `coverage_summary` next with numbers from the run, or
-   `status: "unavailable"` when coverage output is missing.
+1. List changed files from `pr/diff.patch`. Include any `*_spec.rb`,
+   `*.spec.*`, or `*.test.*` paths already named in the test plan.
+2. Map a changed Ruby file `app/.../foo.rb` to `spec/.../foo_spec.rb`
+   when that spec is in the diff or is the conventional twin.
+3. For RSpec paths, pass one command:
+   - label: `rspec impacted`
+   - command: `bundle exec rspec spec/a_spec.rb spec/b_spec.rb --format documentation`
+   - `timeoutMs`: `600000` when the repo is Rails
+4. For a JS repo, use the test script the repo already has
+   (`npm test -- path`, `pnpm vitest run path`). Do not invent a runner.
+   If the diff changes no application or spec files, one command is enough:
+   label `no impacted specs`, command `echo "no impacted specs"`.
+5. Call `run_impacted_tests` with those commands. On HTTP/playground
+   sessions pass `prUrl`. The tool clones the PR head and runs the
+   commands there. Do not skip because `package.json` is missing.
+6. Call `coverage_summary` with `linesPct` from the tool result, or
+   `status: "unavailable"` when `linesPct` is null.
+7. Call `e2e_run`. Omit `baseUrl` when none is configured.
 
 Do not invent a test runner. If the repo layout is unclear, choose the
-smallest package-script command and say so in the command label.
+smallest command the changed paths imply and say so in the command label.
