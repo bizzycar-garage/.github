@@ -22,11 +22,13 @@ export default defineAgent({
     // Hosts bot/lib/ruby-runtime.ts calls before RSpec. Apt on noble uses
     // the Ubuntu archives. curl -fsSL follows ruby-builder release URLs
     // from github.com to the asset hosts. gem install and bundle install
-    // use the RubyGems compact index and gem host.
+    // use the RubyGems compact index and gem host. Comment confirmation
+    // reads and updates issue comments on the GitHub REST API.
     egressDomains: [
       "archive.ubuntu.com",
       "security.ubuntu.com",
       "github.com",
+      "api.github.com",
       "release-assets.githubusercontent.com",
       "objects.githubusercontent.com",
       "index.rubygems.org",

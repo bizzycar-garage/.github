@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
@@ -7,6 +8,14 @@ import {
   type GitHubPullRequestRef,
 } from "@grok/agent-sdk/channels/github";
 import type { ToolContext } from "@grok/agent-sdk/tools";
+import {
+  commentRevisionLine,
+  isGithubUnreachable,
+  isStaleComment,
+  readLiveIssueComment,
+  tryPrWriteToken,
+  upsertLiveIssueComment,
+} from "./github-rest.js";
 
 export const SHA = /^[0-9a-f]{40}$/i;
 
@@ -110,10 +119,11 @@ function sanitizeComment(body: string): string {
   return body.replaceAll("\u0000", "").slice(0, 60_000);
 }
 
-export function commentBody(kind: string, markdown: string): string {
+export function commentBody(kind: string, markdown: string, rev?: string): string {
   const marker = sectionMarker(kind);
   const token = sectionToken(kind);
-  const body = `${markdown.trim()}\n\n${token}\n\n${marker}`;
+  const revLine = commentRevisionLine(rev ?? "");
+  const body = `${markdown.trim()}\n\n${token}${revLine === "" ? "" : `\n${revLine}`}\n\n${marker}`;
   return formatGitHubOutboundComment(sanitizeComment(body));
 }
 
@@ -151,24 +161,92 @@ async function clearStaged(ctx: CommentHost, kind: string): Promise<void> {
   await ctx.host.kv.delete(pendingKey(ctx.session.id, kind));
 }
 
-async function writePrComment(input: {
+function commentKvKey(ref: PrRef, kind: string): string {
+  return `pr-comment:${ref.owner}/${ref.repo}#${ref.number}:${kind}`;
+}
+
+function storedCommentId(value: unknown): number | undefined {
+  return typeof value === "object" &&
+    value !== null &&
+    "commentId" in value &&
+    typeof (value as { commentId: unknown }).commentId === "number"
+    ? (value as { commentId: number }).commentId
+    : undefined;
+}
+
+/**
+ * Post the comment, then read it back.
+ * A continuation session's proxied update can resolve with the comment that
+ * is already on the PR. That response is not a post: the staged body stays
+ * until a live read contains this attempt's revision.
+ */
+async function publishPrComment(input: {
   ctx: CommentHost;
   ref: PrRef;
   kind: string;
   markdown: string;
 }): Promise<{ posted: true; commentId: number; url: string; updated: boolean }> {
   const { ctx, ref, kind, markdown } = input;
+  const rev = randomBytes(8).toString("hex");
+  const body = commentBody(kind, markdown, rev);
+  const kvKey = commentKvKey(ref, kind);
+  const token = await tryPrWriteToken(`${ref.owner}/${ref.repo}`);
+  if (token !== undefined) {
+    try {
+      const posted = await upsertLiveIssueComment({
+        token,
+        owner: ref.owner,
+        repo: ref.repo,
+        number: ref.number,
+        body,
+        rev,
+        commentId: storedCommentId(await ctx.host.kv.get(kvKey)),
+        matches: (existing) => bodyHasMarker(existing, kind),
+      });
+      await ctx.host.kv.put(kvKey, { commentId: posted.id });
+      return {
+        posted: true,
+        commentId: posted.id,
+        url: posted.htmlUrl,
+        updated: posted.updated,
+      };
+    } catch (error) {
+      if (isStaleComment(error)) {
+        throw error;
+      }
+      const githubHttp = error instanceof Error && /^GitHub comment HTTP \d+$/.test(error.message);
+      if (!isGithubUnreachable(error) && !githubHttp) {
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+    }
+  }
+  const posted = await writePrComment({ ctx, ref, kind, body });
+  if (token !== undefined) {
+    const live = await readLiveIssueComment({
+      token,
+      owner: ref.owner,
+      repo: ref.repo,
+      number: ref.number,
+      commentId: posted.commentId,
+    });
+    const confirmed = live.status === "ok" && live.body.includes(`mr-nexus-rev:${rev}`);
+    if (!confirmed) {
+      throw new Error("GitHub kept the previous mr-nexus comment body");
+    }
+  }
+  return posted;
+}
+
+async function writePrComment(input: {
+  ctx: CommentHost;
+  ref: PrRef;
+  kind: string;
+  body: string;
+}): Promise<{ posted: true; commentId: number; url: string; updated: boolean }> {
+  const { ctx, ref, kind, body } = input;
   const octokit = await ctx.host.github.getOctokit();
-  const kvKey = `pr-comment:${ref.owner}/${ref.repo}#${ref.number}:${kind}`;
-  const body = commentBody(kind, markdown);
-  const stored = await ctx.host.kv.get(kvKey);
-  const storedId =
-    typeof stored === "object" &&
-    stored !== null &&
-    "commentId" in stored &&
-    typeof (stored as { commentId: unknown }).commentId === "number"
-      ? (stored as { commentId: number }).commentId
-      : undefined;
+  const kvKey = commentKvKey(ref, kind);
+  const storedId = storedCommentId(await ctx.host.kv.get(kvKey));
 
   const updated = async (commentId: number) => {
     const response = await octokit.rest.issues.updateComment({
@@ -238,7 +316,7 @@ export async function upsertPrComment(input: {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
-      const result = await writePrComment(input);
+      const result = await publishPrComment(input);
       await clearStaged(input.ctx, input.kind);
       return result;
     } catch (error) {
@@ -251,8 +329,16 @@ export async function upsertPrComment(input: {
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-/** Publish comments a tool staged but did not finish posting. */
-export async function flushStagedPrComments(ctx: CommentHost): Promise<void> {
+/**
+ * Publish comments a tool staged but did not finish posting.
+ * `consumeAttempt: false` is the per-tool flush, so a failed confirm does
+ * not use up the turn-end retry.
+ */
+export async function flushStagedPrComments(
+  ctx: CommentHost,
+  options?: { consumeAttempt?: boolean },
+): Promise<void> {
+  const consumeAttempt = options?.consumeAttempt !== false;
   for (const kind of COMMENT_KINDS) {
     const key = pendingKey(ctx.session.id, kind);
     const staged = await ctx.host.kv.get(key);
@@ -261,9 +347,11 @@ export async function flushStagedPrComments(ctx: CommentHost): Promise<void> {
       await ctx.host.kv.delete(key);
       continue;
     }
-    await ctx.host.kv.put(key, { ...staged, attempts: staged.attempts + 1 });
+    if (consumeAttempt) {
+      await ctx.host.kv.put(key, { ...staged, attempts: staged.attempts + 1 });
+    }
     try {
-      await writePrComment({
+      await publishPrComment({
         ctx,
         ref: { owner: staged.owner, repo: staged.repo, number: staged.number },
         kind: staged.kind,
@@ -271,7 +359,7 @@ export async function flushStagedPrComments(ctx: CommentHost): Promise<void> {
       });
       await ctx.host.kv.delete(key);
     } catch {
-      // Leave the record. A later finished turn tries once more.
+      // Leave the record. The turn-end hook tries again.
     }
   }
 }
