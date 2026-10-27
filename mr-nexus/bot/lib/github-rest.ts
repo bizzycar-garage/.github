@@ -3,7 +3,8 @@
  *
  * A continuation turn's proxied Octokit call can resolve with the comment
  * already on the pull request and leave that body unchanged. Callers keep
- * the staged comment unless a direct read shows the revision they just sent.
+ * the staged comment unless a direct read shows the revision they just sent
+ * and a newer updated_at.
  */
 
 const GITHUB_API = "https://api.github.com";
@@ -33,6 +34,34 @@ export function commentRevisionLine(rev: string): string {
   return REV.test(rev) ? `mr-nexus-rev:${rev}` : "";
 }
 
+/**
+ * A live read confirms a write only when the body contains this attempt's
+ * revision and `updated_at` moved. A proxy echo of the request body has the
+ * revision and the previous timestamp, so it does not count.
+ */
+export function commentWriteLanded(input: {
+  body: string;
+  updatedAt: string | undefined;
+  rev: string;
+  previousUpdatedAt?: string;
+}): boolean {
+  if (!REV.test(input.rev) || !input.body.includes(`mr-nexus-rev:${input.rev}`)) {
+    return false;
+  }
+  const next = Date.parse(input.updatedAt ?? "");
+  if (!Number.isFinite(next)) {
+    return false;
+  }
+  if (input.previousUpdatedAt === undefined) {
+    return true;
+  }
+  const previous = Date.parse(input.previousUpdatedAt);
+  if (!Number.isFinite(previous)) {
+    return true;
+  }
+  return next > previous;
+}
+
 export async function tryPrWriteToken(repo: string): Promise<string | undefined> {
   if (testTransport !== undefined) {
     return testTransport.token;
@@ -46,20 +75,7 @@ export async function tryPrWriteToken(repo: string): Promise<string | undefined>
     return undefined;
   }
   try {
-    const response = await fetch(`${base}/v0/scm-events/github-token`, {
-      method: "POST",
-      redirect: "error",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ repos: [repo], permissions: "pr-write" }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!response.ok) {
-      return undefined;
-    }
-    const json: unknown = await response.json();
+    const json = await postGithubToken(base, apiKey, repo);
     if (!isRecord(json) || typeof json.token !== "string") {
       return undefined;
     }
@@ -70,10 +86,49 @@ export async function tryPrWriteToken(repo: string): Promise<string | undefined>
   }
 }
 
+/** Follow a same-origin redirect. `redirect: "error"` dropped the lease and the proxy 200 was trusted. */
+async function postGithubToken(base: string, apiKey: string, repo: string): Promise<unknown> {
+  let url = `${base}/v0/scm-events/github-token`;
+  const body = JSON.stringify({ repos: [repo], permissions: "pr-write" });
+  for (let hop = 0; hop < 3; hop += 1) {
+    const response = await fetch(url, {
+      method: "POST",
+      redirect: "manual",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
+      body,
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      await response.arrayBuffer().catch(() => undefined);
+      if (location === null) {
+        return undefined;
+      }
+      const next = new URL(location, url);
+      if (next.origin !== new URL(base).origin) {
+        return undefined;
+      }
+      url = next.toString();
+      continue;
+    }
+    if (!response.ok) {
+      process.stderr.write(`[mr-nexus] github-token HTTP ${response.status}\n`);
+      await response.arrayBuffer().catch(() => undefined);
+      return undefined;
+    }
+    return (await response.json()) as unknown;
+  }
+  return undefined;
+}
+
 export type LiveComment = {
   id: number;
   htmlUrl: string;
   updated: boolean;
+  updatedAt: string;
 };
 
 export async function upsertLiveIssueComment(input: {
@@ -93,17 +148,24 @@ export async function upsertLiveIssueComment(input: {
   }
   let commentId = input.commentId;
   let updated = commentId !== undefined;
+  let previousUpdatedAt: string | undefined;
   if (commentId !== undefined) {
+    const before = await readLiveIssueComment({ token, owner, repo, number, commentId });
+    if (before.status === "ok") {
+      previousUpdatedAt = before.updatedAt;
+    }
     const patched = await patchComment(token, owner, repo, commentId, body);
     if (patched === undefined) {
       commentId = undefined;
       updated = false;
+      previousUpdatedAt = undefined;
     }
   }
   if (commentId === undefined) {
-    const existing = await listComments(token, owner, repo, number);
+    const existing = await listLiveIssueComments(token, owner, repo, number);
     const match = existing.find((item) => input.matches(item.body));
     if (match !== undefined) {
+      previousUpdatedAt = match.updatedAt;
       const patched = await patchComment(token, owner, repo, match.id, body);
       if (patched === undefined) {
         throw new Error("GitHub comment HTTP 404");
@@ -113,16 +175,25 @@ export async function upsertLiveIssueComment(input: {
     } else {
       commentId = (await createComment(token, owner, repo, number, body)).id;
       updated = false;
+      previousUpdatedAt = undefined;
     }
   }
   const live = await readLiveIssueComment({ token, owner, repo, number, commentId });
   if (live.status === "unreachable" || live.status === "forbidden") {
     throw new Error("github-unreachable: could not read the comment back");
   }
-  if (live.status !== "ok" || !live.body.includes(`mr-nexus-rev:${rev}`)) {
+  if (
+    live.status !== "ok" ||
+    !commentWriteLanded({
+      body: live.body,
+      updatedAt: live.updatedAt,
+      rev,
+      previousUpdatedAt,
+    })
+  ) {
     throw new Error(STALE_COMMENT);
   }
-  return { id: commentId, htmlUrl: live.htmlUrl, updated };
+  return { id: commentId, htmlUrl: live.htmlUrl, updated, updatedAt: live.updatedAt ?? "" };
 }
 
 export async function readLiveIssueComment(input: {
@@ -132,7 +203,7 @@ export async function readLiveIssueComment(input: {
   number: number;
   commentId: number;
 }): Promise<
-  | { status: "ok"; body: string; htmlUrl: string }
+  | { status: "ok"; body: string; htmlUrl: string; updatedAt: string | undefined }
   | { status: "unreachable" }
   | { status: "forbidden" }
   | { status: "missing" }
@@ -153,9 +224,11 @@ export async function readLiveIssueComment(input: {
       throw new Error(`GitHub comment HTTP ${response.status}`);
     }
     const body = typeof response.json.body === "string" ? response.json.body : "";
+    const updatedAt = typeof response.json.updated_at === "string" ? response.json.updated_at : undefined;
     return {
       status: "ok",
       body,
+      updatedAt,
       htmlUrl: commentHtmlUrl(input.owner, input.repo, input.number, input.commentId, response.json.html_url),
     };
   } catch (error) {
@@ -205,13 +278,13 @@ async function createComment(
   return { id };
 }
 
-async function listComments(
+export async function listLiveIssueComments(
   token: string,
   owner: string,
   repo: string,
   number: number,
-): Promise<Array<{ id: number; body: string | null }>> {
-  const found: Array<{ id: number; body: string | null }> = [];
+): Promise<Array<{ id: number; body: string | null; updatedAt: string | undefined }>> {
+  const found: Array<{ id: number; body: string | null; updatedAt: string | undefined }> = [];
   for (let page = 1; page <= 5; page += 1) {
     const response = await github(
       token,
@@ -228,7 +301,11 @@ async function listComments(
       if (!isRecord(item)) continue;
       const id = numericId(item.id);
       if (id === undefined) continue;
-      found.push({ id, body: typeof item.body === "string" ? item.body : null });
+      found.push({
+        id,
+        body: typeof item.body === "string" ? item.body : null,
+        updatedAt: typeof item.updated_at === "string" ? item.updated_at : undefined,
+      });
     }
     if (response.json.length < 100) {
       break;
@@ -256,6 +333,7 @@ async function github(
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${token}`,
+        "cache-control": "no-cache",
         "user-agent": "mr-nexus",
         "x-github-api-version": "2022-11-28",
         ...(body === undefined ? {} : { "content-type": "application/json" }),
