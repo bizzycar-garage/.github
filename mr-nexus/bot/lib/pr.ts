@@ -1,7 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
-  createGitHubCheck,
   formatGitHubOutboundComment,
   parseGitHubPrContinuationKey,
   parseGitHubPrRef,
@@ -150,10 +149,12 @@ export async function upsertPrComment(input: {
 }
 
 /**
- * Best-effort Checks API write. With `permissions: "pr-write"` (no `checks: true`)
- * merge-box checks are unavailable; comment posting must still succeed.
+ * Comments are the result. `permissions: "pr-write"` does not include
+ * `checks:write` (`checks: true` would upgrade the lease to contents:write).
+ * Calling the Checks API returns 403 and that line was read as a test failure.
+ * This does not call GitHub.
  */
-export async function tryCreateCheck(input: {
+export async function tryCreateCheck(_input: {
   github: ToolContext["host"]["github"];
   owner: string;
   repo: string;
@@ -163,24 +164,9 @@ export async function tryCreateCheck(input: {
   summary: string;
   conclusion: "success" | "failure" | "neutral" | "skipped";
 }): Promise<{ checkUrl?: string; skipped?: string }> {
-  try {
-    const check = await createGitHubCheck({
-      github: input.github,
-      owner: input.owner,
-      repo: input.repo,
-      name: input.name,
-      sha: input.sha,
-      output: { title: input.title, summary: input.summary },
-    });
-    await check.conclude({
-      conclusion: input.conclusion,
-      output: { title: input.title, summary: input.summary },
-    });
-    return { checkUrl: check.url };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { skipped: message.slice(0, 300) };
-  }
+  return {
+    skipped: "not posted; pr-write has no checks:write. The PR comment is the result.",
+  };
 }
 
 /** Fetch PR meta + diff through the Cursor GitHub proxy and seed the workspace. */

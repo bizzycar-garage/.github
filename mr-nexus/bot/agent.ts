@@ -19,6 +19,6 @@ export default defineAgent({
     sandbox: true,
   },
   hosting: {
-    secretNames: ["E2E_BASE_URL"],
+    secretNames: ["E2E_BASE_URL", "HIVE_GIT_READ_TOKEN"],
   },
 });
