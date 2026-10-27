@@ -21,6 +21,9 @@ Confluence pages.
 6. If `run_impacted_tests` returns `outcome: "skipped"`, say the
    checkout was skipped. That is not a test failure and not a
    check-run error. Do not describe HTTP 403 as a failed test.
+   If it returns `outcome: "bootstrap-failed"`, Ruby did not install
+   and RSpec was not started. That is not a spec failure. The
+   impacted-tests comment has the installer log.
 7. Call `coverage_summary` with the line coverage the tool
    returned, or `status: "unavailable"` when it is null.
 8. Call `e2e_run`. Omit `baseUrl` unless `E2E_BASE_URL` or an

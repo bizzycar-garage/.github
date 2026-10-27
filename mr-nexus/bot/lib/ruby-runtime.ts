@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -25,9 +26,11 @@ ruby_bin=$(command -v ruby 2>/dev/null || true)
 bundle_bin=$(command -v bundle 2>/dev/null || true)
 if [ -n "$ruby_bin" ]; then
   echo "MR_NEXUS_RUBY_BIN=$(dirname "$ruby_bin")"
-  "$ruby_bin" -e 'print "MR_NEXUS_RUBY_VERSION=#{RUBY_VERSION}\\n"'
+  echo "MR_NEXUS_RUBY_EXE=$ruby_bin"
+  "$ruby_bin" -e 'print "MR_NEXUS_RUBY_VERSION=#{RUBY_VERSION}\\nMR_NEXUS_GEM_HOME=#{Gem.dir}\\nMR_NEXUS_GEM_PATH=#{Gem.path.join(File::PATH_SEPARATOR)}\\nMR_NEXUS_GEM_BIN=#{Gem.bindir}\\n"'
 fi
 if [ -n "$bundle_bin" ]; then
+  echo "MR_NEXUS_BUNDLE_EXE=$bundle_bin"
   ver=$("$bundle_bin" -v 2>/dev/null | awk 'NR==1 { print $NF }' || true)
   if [ -n "$ver" ]; then
     echo "MR_NEXUS_BUNDLE_VERSION=$ver"
@@ -50,9 +53,12 @@ run_root() {
   fi
 }
 if command -v apt-get >/dev/null 2>&1; then
-  run_root apt-get update -y
-  run_root apt-get install -y ca-certificates curl build-essential libffi-dev libyaml-dev zlib1g-dev libssl-dev libreadline-dev libpq-dev ruby ruby-dev
-  run_root apt-get install -y ruby-bundler || true
+  # A blackholed mirror must fail with apt's own error, not sit until the
+  # step is killed (that kill has no exit code and was reported as 127).
+  apt_opts="-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=2"
+  run_root apt-get $apt_opts update -y
+  run_root apt-get $apt_opts install -y ca-certificates curl build-essential libffi-dev libyaml-dev zlib1g-dev libssl-dev libreadline-dev libpq-dev ruby ruby-dev
+  run_root apt-get $apt_opts install -y ruby-bundler || true
 elif command -v apk >/dev/null 2>&1; then
   run_root apk add --no-cache ca-certificates curl build-base ruby ruby-dev ruby-bundler
 else
@@ -69,11 +75,27 @@ mkdir -p "$prefix"
 pick_bin() {
   if [ -x "$prefix/bin/ruby" ]; then
     echo "$prefix/bin"
-  elif [ -x "$prefix/x64/bin/ruby" ]; then
-    echo "$prefix/x64/bin"
-  elif [ -x "$prefix/arm64/bin/ruby" ]; then
-    echo "$prefix/arm64/bin"
+    return
   fi
+  if [ -x "$prefix/x64/bin/ruby" ]; then
+    echo "$prefix/x64/bin"
+    return
+  fi
+  if [ -x "$prefix/arm64/bin/ruby" ]; then
+    echo "$prefix/arm64/bin"
+    return
+  fi
+  for dir in "$prefix"/*; do
+    [ -d "$dir" ] || continue
+    if [ -x "$dir/bin/ruby" ]; then
+      echo "$dir/bin"
+      return
+    fi
+    if [ -x "$dir/x64/bin/ruby" ]; then
+      echo "$dir/x64/bin"
+      return
+    fi
+  done
 }
 bin=$(pick_bin || true)
 if [ -z "$bin" ]; then
@@ -86,10 +108,12 @@ if [ -z "$bin" ]; then
       https://github.com/ruby/ruby-builder/releases/download/*) ;;
       *) continue ;;
     esac
-    if curl -fsSL --retry 2 --max-time 90 "$url" -o "$tmp/ruby.tar.gz"; then
+    echo "mr-nexus: downloading $url" >&2
+    if curl -fL --retry 1 --connect-timeout 15 --max-time 40 "$url" -o "$tmp/ruby.tar.gz"; then
       found=1
       break
     fi
+    echo "mr-nexus: download failed for $url" >&2
   done <<EOF
 \${MR_NEXUS_RUBY_URLS:-}
 EOF
@@ -120,21 +144,26 @@ if [ -n "\${MR_NEXUS_BUNDLER_VERSION:-}" ]; then
 else
   gem install bundler --no-document
 fi
-bundle -v
-ruby -e 'print "MR_NEXUS_GEM_BIN=#{Gem.bindir}\\n"'
+ruby -e 'print "MR_NEXUS_GEM_BIN=#{Gem.bindir}\\nMR_NEXUS_GEM_HOME=#{Gem.dir}\\nMR_NEXUS_GEM_PATH=#{Gem.path.join(File::PATH_SEPARATOR)}\\nMR_NEXUS_BUNDLE_EXE=#{Gem.bindir}/bundle\\n"'
+bindir=$(ruby -e 'print Gem.bindir')
+"$bindir/bundle" -v
 `;
 
 const BUNDLE_CHECK_SH = `
-bundle check
+set -eu
+bin="\${MR_NEXUS_BUNDLE_BIN:-bundle}"
+"$bin" check
 `;
 
 const BUNDLE_INSTALL_SH = `
 set -eu
-bundle install --jobs "\${BUNDLE_JOBS:-2}" --retry "\${BUNDLE_RETRY:-3}"
+bin="\${MR_NEXUS_BUNDLE_BIN:-bundle}"
+"$bin" install --jobs "\${BUNDLE_JOBS:-2}" --retry "\${BUNDLE_RETRY:-3}"
 `;
 
 export type ShellResult = {
   exitCode: number | null;
+  signal?: NodeJS.Signals | null;
   log: string;
   durationMs: number;
 };
@@ -149,8 +178,23 @@ export type ShellRunner = (input: {
 
 export type RubyBootstrap =
   | { ok: true; skipped: true }
-  | { ok: true; skipped: false; note: string; env: NodeJS.ProcessEnv; logTail: string }
+  | {
+      ok: true;
+      skipped: false;
+      note: string;
+      env: NodeJS.ProcessEnv;
+      logTail: string;
+      /** Absolute `bundle` binary the spec child must exec. */
+      bundleBin?: string;
+    }
   | { ok: false; note: string; exitCode: number | null; durationMs: number; logTail: string };
+
+/** Replace a leading `bundle` command word with its absolute path. */
+export function commandWithAbsoluteBundle(command: string, bundleBin: string | undefined): string {
+  if (bundleBin === undefined || !bundleBin.startsWith("/")) return command;
+  const quoted = `'${bundleBin.replaceAll("'", `'\\''`)}'`;
+  return command.replace(/(^|[\s;&|`(])bundle(?=$|[\s;&|`])/g, `$1${quoted}`);
+}
 
 type Probe = { ruby?: string; bundle?: string; bin?: string };
 
@@ -237,6 +281,22 @@ function withPath(env: NodeJS.ProcessEnv, binDir: string | undefined): NodeJS.Pr
   return { ...env, PATH: `${binDir}:${current}` };
 }
 
+/** Ruby bin, then gem bin, plus GEM_HOME / GEM_PATH / absolute bundle. */
+function applyMarkers(env: NodeJS.ProcessEnv, log: string): NodeJS.ProcessEnv {
+  const rubyBin = marker(log, "MR_NEXUS_RUBY_BIN");
+  const gemBin = marker(log, "MR_NEXUS_GEM_BIN");
+  const gemHome = marker(log, "MR_NEXUS_GEM_HOME");
+  const gemPath = marker(log, "MR_NEXUS_GEM_PATH");
+  const bundleExe = marker(log, "MR_NEXUS_BUNDLE_EXE");
+  let next = env;
+  if (rubyBin) next = withPath(next, rubyBin);
+  if (gemBin) next = withPath(next, gemBin);
+  if (gemHome) next = { ...next, GEM_HOME: gemHome };
+  if (gemPath) next = { ...next, GEM_PATH: gemPath };
+  if (bundleExe?.startsWith("/")) next = { ...next, MR_NEXUS_BUNDLE_BIN: bundleExe };
+  return next;
+}
+
 function tail(parts: string[]): string {
   return redactSecrets(parts.filter((item) => item.trim()).join("\n")).slice(-4000);
 }
@@ -249,11 +309,21 @@ async function readOptional(path: string): Promise<string | undefined> {
   }
 }
 
+function shellInvocation(script: string): { file: string; args: string[] } {
+  try {
+    accessSync("/usr/bin/stdbuf", constants.X_OK);
+    return { file: "/usr/bin/stdbuf", args: ["-oL", "-eL", "sh", "-c", script] };
+  } catch {
+    return { file: "sh", args: ["-c", script] };
+  }
+}
+
 function defaultRunner(): ShellRunner {
-  return async ({ script, cwd, env, timeoutMs }) => {
+  return async ({ step, script, cwd, env, timeoutMs }) => {
     const started = Date.now();
     return await new Promise((resolve) => {
-      const child = spawn("sh", ["-c", script], { cwd, env, shell: false });
+      const invoke = shellInvocation(script);
+      const child = spawn(invoke.file, invoke.args, { cwd, env, shell: false });
       let log = "";
       const onData = (chunk: Buffer) => {
         log = (log + chunk.toString("utf8")).slice(-8000);
@@ -261,14 +331,23 @@ function defaultRunner(): ShellRunner {
       child.stdout?.on("data", onData);
       child.stderr?.on("data", onData);
       const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
         clearTimeout(timer);
-        resolve({ exitCode: code, log: redactSecrets(log), durationMs: Date.now() - started });
+        if (signal) {
+          log += `\n[${step} killed by ${signal}; the installer exited with no status. This is not an RSpec result.]\n`;
+        }
+        resolve({
+          exitCode: code,
+          signal: signal ?? null,
+          log: redactSecrets(log),
+          durationMs: Date.now() - started,
+        });
       });
       child.on("error", (error) => {
         clearTimeout(timer);
         resolve({
           exitCode: null,
+          signal: null,
           log: redactSecrets(String(error)),
           durationMs: Date.now() - started,
         });
@@ -285,6 +364,7 @@ export async function ensureImpactedRuby(input: {
   checkoutDir: string;
   commands: readonly string[];
   run?: ShellRunner;
+  onProgress?: (update: { step: string; logTail: string }) => Promise<void> | void;
 }): Promise<RubyBootstrap> {
   if (!input.commands.some((command) => commandNeedsRuby(command))) {
     return { ok: true, skipped: true };
@@ -318,6 +398,8 @@ export async function ensureImpactedRuby(input: {
       timeoutMs,
     });
     logs.push(result.log);
+    env = applyMarkers(env, result.log);
+    await Promise.resolve(input.onProgress?.({ step, logTail: tail(logs) })).catch(() => undefined);
     return result;
   };
 
@@ -330,7 +412,6 @@ export async function ensureImpactedRuby(input: {
   const vendor = join(input.checkoutDir, "vendor/bundle");
 
   let probe = parseProbe((await exec("probe", PROBE_SH, 20_000)).log);
-  if (probe.bin) env = withPath(env, probe.bin);
 
   const rubyReady = versionOk(probe.ruby, requestedRuby);
   const bundleReady = versionOk(probe.bundle, requestedBundler);
@@ -349,9 +430,8 @@ export async function ensureImpactedRuby(input: {
     }
   }
 
-  const apt = await exec("apt-packages", APT_SH, 240_000);
+  const apt = await exec("apt-packages", APT_SH, 180_000);
   probe = parseProbe((await exec("probe", PROBE_SH, 20_000, env)).log);
-  if (probe.bin) env = withPath(env, probe.bin);
   if (!rubyReady && probe.ruby && versionOk(probe.ruby, requestedRuby)) {
     installed = true;
   }
@@ -364,22 +444,26 @@ export async function ensureImpactedRuby(input: {
       MR_NEXUS_RUBY_PREFIX: prefix,
       MR_NEXUS_RUBY_URLS: rubyDownloadUrls(requestedRuby, process.arch).join("\n"),
     });
-    const prebuilt = await exec("prebuilt-ruby", PREBUILT_SH, 240_000, preEnv);
+    const prebuilt = await exec("prebuilt-ruby", PREBUILT_SH, 180_000, preEnv);
     if (prebuilt.exitCode !== 0) {
-      return fail(`could not install ruby ${requestedRuby}`, prebuilt.exitCode ?? 127);
+      const timedOut = prebuilt.exitCode === null;
+      return fail(
+        timedOut
+          ? `could not install ruby ${requestedRuby} (installer timed out; RSpec was not started)`
+          : `could not install ruby ${requestedRuby}`,
+        prebuilt.exitCode,
+      );
     }
-    const parsed = parseProbe(prebuilt.log);
-    env = withPath(env, parsed.bin);
     installed = true;
     probe = parseProbe((await exec("probe", PROBE_SH, 20_000, env)).log);
     if (!versionOk(probe.ruby, requestedRuby)) {
-      return fail(`ruby ${requestedRuby} is not on PATH after install`, 127);
+      return fail(`ruby ${requestedRuby} is not on PATH after install`, null);
     }
   } else if (!probe.ruby) {
     if (apt.exitCode !== 0) {
-      return fail("could not install ruby (no apt/apk package and no .ruby-version pin)", apt.exitCode ?? 127);
+      return fail("could not install ruby (no apt/apk package and no .ruby-version pin)", apt.exitCode);
     }
-    return fail("ruby is still missing after the package install", 127);
+    return fail("ruby is still missing after the package install", null);
   }
 
   if (!versionOk(probe.bundle, requestedBundler)) {
@@ -389,13 +473,12 @@ export async function ensureImpactedRuby(input: {
     if (gem.exitCode !== 0) {
       return fail(
         requestedBundler ? `could not install bundler ${requestedBundler}` : "could not install bundler",
-        gem.exitCode ?? 127,
+        gem.exitCode,
       );
     }
-    env = withPath(env, marker(gem.log, "MR_NEXUS_GEM_BIN"));
     installed = true;
     probe = parseProbe((await exec("probe", PROBE_SH, 20_000, env)).log);
-    if (!probe.bundle) return fail("bundle is still missing after gem install", 127);
+    if (!probe.bundle) return fail("bundle is still missing after gem install", null);
   }
 
   if (!hasGemfile) {
@@ -410,7 +493,7 @@ export async function ensureImpactedRuby(input: {
   });
   const installedGems = await exec("bundle-install", BUNDLE_INSTALL_SH, 540_000, bundleEnv);
   if (installedGems.exitCode !== 0) {
-    return fail("bundle install failed", installedGems.exitCode ?? 1);
+    return fail("bundle install failed", installedGems.exitCode);
   }
   probe = parseProbe((await exec("probe", PROBE_SH, 20_000, bundleEnv)).log);
   return ready(probe, installed, "bundle install ok", bundleEnv);
@@ -424,12 +507,14 @@ export async function ensureImpactedRuby(input: {
     const ruby = current.ruby ?? "unknown";
     const bundler = current.bundle ?? "unknown";
     const how = didInstall ? "installed " : "";
+    const bundleBin = typeof nextEnv.MR_NEXUS_BUNDLE_BIN === "string" ? nextEnv.MR_NEXUS_BUNDLE_BIN : undefined;
     return {
       ok: true,
       skipped: false,
       note: `${how}ruby ${ruby}, bundler ${bundler}; ${gems}`,
       env: nextEnv,
       logTail: tail(logs),
+      ...(bundleBin === undefined ? {} : { bundleBin }),
     };
   }
 }

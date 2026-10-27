@@ -8,10 +8,16 @@ import {
   resolvePrPin,
   type CheckoutResult,
 } from "../lib/checkout.js";
-import { commandNeedsRuby, ensureImpactedRuby, type RubyBootstrap } from "../lib/ruby-runtime.js";
+import {
+  commandNeedsRuby,
+  commandWithAbsoluteBundle,
+  ensureImpactedRuby,
+  type RubyBootstrap,
+} from "../lib/ruby-runtime.js";
 import {
   prUrlSchemaDescription,
   requirePrRef,
+  stagePrComment,
   tryCreateCheck,
   upsertPrComment,
 } from "../lib/pr.js";
@@ -43,8 +49,10 @@ const TOKEN_ENV = [
   "CURSOR_SERVICE_ACCOUNT_KEY",
 ];
 
-function testEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env = { ...process.env, ...extra };
+function specEnv(runtimeEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  // The runtime env already has the install's PATH, GEM_HOME, and GEM_PATH.
+  // Overlaying process.env would put the pod PATH back in front of that install.
+  const env: NodeJS.ProcessEnv = { ...(runtimeEnv ?? process.env) };
   for (const key of TOKEN_ENV) {
     delete env[key];
   }
@@ -56,14 +64,21 @@ async function runCommand(
   label: string,
   shellCommand: string,
   timeoutMs: number,
-  extraEnv?: NodeJS.ProcessEnv,
+  runtimeEnv?: NodeJS.ProcessEnv,
+  bundleBin?: string,
 ): Promise<CommandResult> {
   const started = Date.now();
+  const command = commandWithAbsoluteBundle(
+    shellCommand,
+    bundleBin ?? (typeof runtimeEnv?.MR_NEXUS_BUNDLE_BIN === "string" ? runtimeEnv.MR_NEXUS_BUNDLE_BIN : undefined),
+  );
   return await new Promise((resolve) => {
-    const child = spawn(shellCommand, {
+    // shell:false so the child is /bin/sh -c with the install's env.
+    // shell:true looks up `bundle` on a PATH that does not include ~/.mr-nexus.
+    const child = spawn("/bin/sh", ["-c", command], {
       cwd,
-      shell: true,
-      env: testEnv(extraEnv),
+      shell: false,
+      env: specEnv(runtimeEnv),
     });
     const chunks: Buffer[] = [];
     const onData = (chunk: Buffer) => {
@@ -107,6 +122,7 @@ function resultsMarkdown(
   linesPct: number | undefined,
   planned: { label: string; command: string }[],
   runtimeNote: string | undefined,
+  installLog?: string,
 ): string {
   if (!checkout.ok) {
     const lines = [
@@ -115,6 +131,27 @@ function resultsMarkdown(
       `**Checkout:** skipped — ${checkout.reason}`,
       "**Result:** not run. This is not a test failure.",
       "**Line coverage:** unavailable",
+      "",
+    ];
+    for (const item of planned) {
+      lines.push(`- not run \`${item.label}\``);
+      lines.push(`  \`${item.command}\``);
+    }
+    return lines.join("\n");
+  }
+  if (installLog !== undefined) {
+    const lines = [
+      "## Mr. Nexus — impacted tests",
+      "",
+      `**Checkout:** \`${checkout.headSha}\` (shallow)`,
+      ...(runtimeNote ? [`**Runtime:** ${runtimeNote}`] : []),
+      "**Result:** not run. Bootstrap failed, so RSpec was not started.",
+      "**Line coverage:** unavailable",
+      "",
+      "Install log:",
+      "```",
+      installLog.trim().slice(-2000) || "(no installer output)",
+      "```",
       "",
     ];
     for (const item of planned) {
@@ -148,15 +185,17 @@ function resultsMarkdown(
 async function bootstrapRuby(
   checkoutDir: string,
   commands: readonly string[],
+  onProgress?: (update: { step: string; logTail: string }) => Promise<void> | void,
 ): Promise<{
   failed?: Extract<RubyBootstrap, { ok: false }>;
   note?: string;
   env?: NodeJS.ProcessEnv;
+  bundleBin?: string;
 }> {
-  const runtime = await ensureImpactedRuby({ checkoutDir, commands });
+  const runtime = await ensureImpactedRuby({ checkoutDir, commands, onProgress });
   if (!runtime.ok) return { failed: runtime };
   if (runtime.skipped) return {};
-  return { note: runtime.note, env: runtime.env };
+  return { note: runtime.note, env: runtime.env, bundleBin: runtime.bundleBin };
 }
 
 export default defineTool({
@@ -213,6 +252,7 @@ export default defineTool({
     const fullLogs: string[] = [];
     const results: CommandResult[] = [];
     let runtimeNote: string | undefined;
+    let installLog: string | undefined;
     if (!checkout.ok) {
       for (const item of commands) {
         results.push({
@@ -224,41 +264,69 @@ export default defineTool({
           logTail: "",
         });
       }
-    } else {
-      const runtime = await bootstrapRuby(checkout.checkoutDir, commands.map((item) => item.command));
+    } else if (commands.some((item) => commandNeedsRuby(item.command))) {
+      await stagePrComment({
+        ctx,
+        ref,
+        kind: "impacted-tests",
+        markdown: [
+          "## Mr. Nexus — impacted tests",
+          "",
+          `**Checkout:** \`${checkout.headSha}\` (shallow)`,
+          "**Runtime:** installing Ruby and Bundler",
+          "**Result:** not finished",
+          "",
+        ].join("\n"),
+      });
+    }
+    if (checkout.ok) {
+      const runtime = await bootstrapRuby(
+        checkout.checkoutDir,
+        commands.map((item) => item.command),
+        async ({ step, logTail }) => {
+          await stagePrComment({
+            ctx,
+            ref,
+            kind: "impacted-tests",
+            markdown: [
+              "## Mr. Nexus — impacted tests",
+              "",
+              `**Checkout:** \`${checkout.headSha}\` (shallow)`,
+              `**Runtime:** ${step}`,
+              "**Result:** not finished. Installer output so far:",
+              "",
+              "```",
+              logTail.trim().slice(-2000) || "(no output yet)",
+              "```",
+            ].join("\n"),
+          });
+        },
+      );
       if (runtime.failed) {
         runtimeNote = `bootstrap failed — ${runtime.failed.note}`;
+        installLog = runtime.failed.logTail;
       } else {
         runtimeNote = runtime.note;
-      }
-      for (const item of commands) {
-        if (runtime.failed && commandNeedsRuby(item.command)) {
-          results.push({
-            label: item.label,
-            command: item.command,
-            exitCode: runtime.failed.exitCode,
-            passed: false,
-            durationMs: runtime.failed.durationMs,
-            logTail: runtime.failed.logTail,
-          });
-          continue;
+        for (const item of commands) {
+          const result = await runCommand(
+            checkout.checkoutDir,
+            item.label,
+            item.command,
+            timeout,
+            runtime.env,
+            runtime.bundleBin,
+          );
+          fullLogs.push(result.logTail);
+          results.push(result);
         }
-        const result = await runCommand(
-          checkout.checkoutDir,
-          item.label,
-          item.command,
-          timeout,
-          runtime.env,
-        );
-        fullLogs.push(result.logTail);
-        results.push(result);
       }
     }
 
     const linesPct = extractLinesPct(fullLogs);
-    const executed = checkout.ok;
+    const bootstrapFailed = installLog !== undefined;
+    const executed = checkout.ok && !bootstrapFailed;
     const passed = executed ? results.every((item) => item.passed) : null;
-    const markdown = resultsMarkdown(checkout, results, linesPct, commands, runtimeNote);
+    const markdown = resultsMarkdown(checkout, results, linesPct, commands, runtimeNote, installLog);
     const comment = await upsertPrComment({
       ctx,
       ref,
@@ -286,11 +354,11 @@ export default defineTool({
       checkUrl: check.checkUrl ?? null,
       checkSkipped: check.skipped ?? null,
       executed,
-      outcome: !executed ? "skipped" : passed ? "passed" : "failed",
+      outcome: !checkout.ok ? "skipped" : bootstrapFailed ? "bootstrap-failed" : passed ? "passed" : "failed",
       passed,
-      checkout: executed ? "ready" : "skipped",
-      checkoutReason: executed ? null : checkout.reason,
-      checkoutHeadSha: executed ? checkout.headSha : null,
+      checkout: checkout.ok ? "ready" : "skipped",
+      checkoutReason: checkout.ok ? null : checkout.reason,
+      checkoutHeadSha: checkout.ok ? checkout.headSha : null,
       linesPct: linesPct ?? null,
       results: executed
         ? results.map(({ label, command: cmd, exitCode, passed: commandPassed, durationMs }) => ({
