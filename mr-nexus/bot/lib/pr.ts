@@ -10,9 +10,12 @@ import {
 import type { ToolContext } from "@grok/agent-sdk/tools";
 import {
   commentRevisionLine,
+  commentWriteLanded,
   isGithubUnreachable,
   isStaleComment,
+  listLiveIssueComments,
   readLiveIssueComment,
+  STALE_COMMENT,
   tryPrWriteToken,
   upsertLiveIssueComment,
 } from "./github-rest.js";
@@ -178,7 +181,7 @@ function storedCommentId(value: unknown): number | undefined {
  * Post the comment, then read it back.
  * A continuation session's proxied update can resolve with the comment that
  * is already on the PR. That response is not a post: the staged body stays
- * until a live read contains this attempt's revision.
+ * until a live read contains this attempt's revision and a newer updated_at.
  */
 async function publishPrComment(input: {
   ctx: CommentHost;
@@ -211,30 +214,161 @@ async function publishPrComment(input: {
         updated: posted.updated,
       };
     } catch (error) {
-      if (isStaleComment(error)) {
-        throw error;
-      }
       const githubHttp = error instanceof Error && /^GitHub comment HTTP \d+$/.test(error.message);
-      if (!isGithubUnreachable(error) && !githubHttp) {
+      if (!isStaleComment(error) && !isGithubUnreachable(error) && !githubHttp) {
         throw error instanceof Error ? error : new Error(String(error));
       }
+      // The lease read is the source of truth. A proxy 200 still has to show
+      // up there with a newer updated_at before the staged body can be dropped.
+      const posted = await confirmProxyWithLiveRead({ ctx, ref, kind, body, rev, token });
+      if (posted === undefined) {
+        throw new Error(STALE_COMMENT);
+      }
+      return posted;
     }
   }
-  const posted = await writePrComment({ ctx, ref, kind, body });
-  if (token !== undefined) {
-    const live = await readLiveIssueComment({
-      token,
-      owner: ref.owner,
-      repo: ref.repo,
-      number: ref.number,
-      commentId: posted.commentId,
-    });
-    const confirmed = live.status === "ok" && live.body.includes(`mr-nexus-rev:${rev}`);
-    if (!confirmed) {
-      throw new Error("GitHub kept the previous mr-nexus comment body");
+  const before = await readProxyMarker(ctx, ref, kind);
+  let posted = await writePrComment({ ctx, ref, kind, body, createOnly: false });
+  if (!(await proxyWriteLanded(ctx, ref, posted.commentId, rev, before))) {
+    posted = await writePrComment({ ctx, ref, kind, body, createOnly: true });
+    if (!(await proxyWriteLanded(ctx, ref, posted.commentId, rev, before))) {
+      throw new Error(STALE_COMMENT);
     }
   }
   return posted;
+}
+
+async function confirmProxyWithLiveRead(input: {
+  ctx: CommentHost;
+  ref: PrRef;
+  kind: string;
+  body: string;
+  rev: string;
+  token: string;
+}): Promise<{ posted: true; commentId: number; url: string; updated: boolean } | undefined> {
+  const { ctx, ref, kind, body, rev, token } = input;
+  let listed: Array<{ id: number; updatedAt: string | undefined }> = [];
+  try {
+    listed = await listLiveIssueComments(token, ref.owner, ref.repo, ref.number);
+  } catch (error) {
+    if (isGithubUnreachable(error) || isStaleComment(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+  const patched = await writePrComment({ ctx, ref, kind, body, createOnly: false });
+  if (
+    await liveReadLanded(
+      token,
+      ref,
+      patched.commentId,
+      rev,
+      listed.find((item) => item.id === patched.commentId)?.updatedAt,
+    )
+  ) {
+    return patched;
+  }
+  const created = await writePrComment({ ctx, ref, kind, body, createOnly: true });
+  if (
+    await liveReadLanded(
+      token,
+      ref,
+      created.commentId,
+      rev,
+      listed.find((item) => item.id === created.commentId)?.updatedAt,
+    )
+  ) {
+    return created;
+  }
+  return undefined;
+}
+
+async function liveReadLanded(
+  token: string,
+  ref: PrRef,
+  commentId: number,
+  rev: string,
+  previousUpdatedAt: string | undefined,
+): Promise<boolean> {
+  const live = await readLiveIssueComment({
+    token,
+    owner: ref.owner,
+    repo: ref.repo,
+    number: ref.number,
+    commentId,
+  });
+  return (
+    live.status === "ok" &&
+    commentWriteLanded({
+      body: live.body,
+      updatedAt: live.updatedAt,
+      rev,
+      previousUpdatedAt,
+    })
+  );
+}
+
+async function readProxyMarker(
+  ctx: CommentHost,
+  ref: PrRef,
+  kind: string,
+): Promise<{ id: number; updatedAt: string | undefined } | undefined> {
+  try {
+    const listed = await listProxyComments(ctx, ref);
+    const match = listed.find((item) => bodyHasMarker(item.body, kind));
+    return match === undefined ? undefined : { id: match.id, updatedAt: match.updatedAt };
+  } catch {
+    return undefined;
+  }
+}
+
+async function proxyWriteLanded(
+  ctx: CommentHost,
+  ref: PrRef,
+  commentId: number,
+  rev: string,
+  before: { id: number; updatedAt: string | undefined } | undefined,
+): Promise<boolean> {
+  try {
+    const listed = await listProxyComments(ctx, ref);
+    const match = listed.find((item) => item.id === commentId);
+    if (match === undefined) {
+      return false;
+    }
+    return commentWriteLanded({
+      body: match.body ?? "",
+      updatedAt: match.updatedAt,
+      rev,
+      previousUpdatedAt: before?.id === commentId ? before.updatedAt : undefined,
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function listProxyComments(
+  ctx: CommentHost,
+  ref: PrRef,
+): Promise<Array<{ id: number; body: string | null; updatedAt: string | undefined }>> {
+  const octokit = await ctx.host.github.getOctokit();
+  const existing = await octokit.paginate(octokit.rest.issues.listComments, {
+    owner: ref.owner,
+    repo: ref.repo,
+    issue_number: ref.number,
+    per_page: 100,
+  });
+  const found: Array<{ id: number; body: string | null; updatedAt: string | undefined }> = [];
+  for (const item of existing) {
+    const id = storedCommentId({ commentId: item.id });
+    if (id === undefined) continue;
+    const record = item as { body?: string | null; updated_at?: string | null };
+    found.push({
+      id,
+      body: typeof record.body === "string" ? record.body : null,
+      updatedAt: typeof record.updated_at === "string" ? record.updated_at : undefined,
+    });
+  }
+  return found;
 }
 
 async function writePrComment(input: {
@@ -242,8 +376,9 @@ async function writePrComment(input: {
   ref: PrRef;
   kind: string;
   body: string;
+  createOnly: boolean;
 }): Promise<{ posted: true; commentId: number; url: string; updated: boolean }> {
-  const { ctx, ref, kind, body } = input;
+  const { ctx, ref, kind, body, createOnly } = input;
   const octokit = await ctx.host.github.getOctokit();
   const kvKey = commentKvKey(ref, kind);
   const storedId = storedCommentId(await ctx.host.kv.get(kvKey));
@@ -264,7 +399,7 @@ async function writePrComment(input: {
     };
   };
 
-  if (storedId !== undefined) {
+  if (!createOnly && storedId !== undefined) {
     try {
       return await updated(storedId);
     } catch {
@@ -279,7 +414,7 @@ async function writePrComment(input: {
       issue_number: ref.number,
       per_page: 100,
     });
-    const match = existing.find((item) => bodyHasMarker(item.body, kind));
+    const match = createOnly ? undefined : existing.find((item) => bodyHasMarker(item.body, kind));
     if (match !== undefined) {
       try {
         return await updated(match.id);
